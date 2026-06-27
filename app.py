@@ -737,7 +737,9 @@ def _sb_handover_assignment(alarm_id: str, alarm_tag: str, assignee: str, new_sh
             print(f"[assign] handover error: {r.status_code} {r.text[:80]}")
     except Exception as e:
         print(f"[assign] handover exc: {e}")
-    """آپدیت shift آلارم در Supabase — برای انتقال بین شیفت‌ها"""
+
+def _sb_update_shift(alarm_id: str, new_shift: str):
+    """آپدیت shift آلارم در Supabase — برای انتقال بین شیفت‌ها (بدون تغییر assigned_to)"""
     if not SUPABASE_KEY: return
     try:
         r = requests.patch(
