@@ -645,7 +645,7 @@ SHIFT_MORNING = {
 }
 SHIFT_EVENING = {
     "start": 16, "end": 20,
-    "members": [ "فرهاد", "علی", "پیمان" , "مسعود"]
+    "members": [ "فرهاد", "علی", "پیمان"]
 }
 
 def _is_weekend_tehran():
@@ -7491,26 +7491,44 @@ _restore_notified()
 
 @app.route("/report/weekly")
 def report_weekly_html():
-    """گزارش هفتگی HTML — زیبا و کامل"""
-    which = request.args.get("w", "this")
+    """گزارش آلارم‌های تیم — با بازه تاریخ دلخواه و شماره‌گذاری"""
+    from_str = request.args.get("from", "")
+    to_str = request.args.get("to", "")
     now_dt = datetime.now(TEHRAN)
-    days_since_sat = (now_dt.weekday() - 5) % 7
-    this_week_start = (now_dt - timedelta(days=days_since_sat)).replace(hour=0, minute=0, second=0, microsecond=0)
-    if which == "last":
-        week_start = this_week_start - timedelta(days=7)
-        week_end   = this_week_start
-    else:
-        week_start = this_week_start
-        week_end   = None
-    week_start_str = week_start.strftime("%Y-%m-%dT%H:%M:%S")
-    week_label = f"{week_start.strftime('%d/%m')} — {(week_end - timedelta(days=1)).strftime('%d/%m') if week_end else now_dt.strftime('%d/%m')}"
+
+    range_start = None
+    range_end = None
+    try:
+        if from_str:
+            range_start = TEHRAN.localize(datetime.strptime(from_str, "%Y-%m-%d"))
+    except: range_start = None
+    try:
+        if to_str:
+            range_end = TEHRAN.localize(datetime.strptime(to_str, "%Y-%m-%d")) + timedelta(days=1)
+    except: range_end = None
+
+    if range_start is None and range_end is None:
+        # پیش‌فرض: هفته جاری (شنبه تا الان)
+        days_since_sat = (now_dt.weekday() - 5) % 7
+        range_start = (now_dt - timedelta(days=days_since_sat)).replace(hour=0, minute=0, second=0, microsecond=0)
+        range_end = None
+    elif range_start is None:
+        range_start = range_end - timedelta(days=7)
+    elif range_end is None:
+        range_end = now_dt + timedelta(days=1)
+
+    from_value = (range_start).strftime("%Y-%m-%d")
+    to_value = (range_end - timedelta(days=1)).strftime("%Y-%m-%d") if range_end else now_dt.strftime("%Y-%m-%d")
+    week_label = f"{range_start.strftime('%d/%m/%Y')} — {to_value[8:10]}/{to_value[5:7]}/{to_value[0:4]}"
+
+    range_start_str = range_start.strftime("%Y-%m-%dT%H:%M:%S")
     rows = []
     if SUPABASE_KEY:
         try:
             url = (f"{SUPABASE_URL}/rest/v1/alarm_assignments"
-                   f"?fired_at=gte.{week_start_str}&select=*&order=fired_at.asc")
-            if week_end:
-                url += f"&fired_at=lt.{week_end.strftime('%Y-%m-%dT%H:%M:%S')}"
+                   f"?fired_at=gte.{range_start_str}&select=*&order=fired_at.asc")
+            if range_end:
+                url += f"&fired_at=lt.{range_end.strftime('%Y-%m-%dT%H:%M:%S')}"
             r = requests.get(url, headers=_sb_h(), timeout=10)
             if r.status_code == 200:
                 rows = r.json()
@@ -7525,7 +7543,7 @@ def report_weekly_html():
     rows = [r for r in rows if not alerts_map.get(str(r.get("id","")), {}).get("is_private")]
     rows_html = ""
     false_by_set = set()
-    for row in rows:
+    for idx, row in enumerate(rows, 1):
         aid       = str(row.get("id",""))
         tag       = row.get("alarm_tag","—")
         assignee  = row.get("assigned_to","") or "⏳ منتظر"
@@ -7569,6 +7587,8 @@ def report_weekly_html():
                 false_detail = f'<div class="false-detail"><span>🕐 {false_at}</span>{("<span class=reason>"+false_rsn+"</span>") if false_rsn else ""}</div>'
         rows_html += f"""
         <div class="card card-{status_cls}" data-search="{(assignee + ' ' + sym + ' ' + tag + ' ' + creator + ' ' + false_by).lower()}" data-falseby="{false_by.lower()}" data-status="{status_cls}">
+          <div class="card-num">{idx}</div>
+          <div class="card-inner">
           <div class="card-glow"></div>
           <div class="card-header">
             <div class="card-icon">{direction_icon}</div>
@@ -7602,6 +7622,7 @@ def report_weekly_html():
             </div>
             <span class="rail-label">{dir_zone_label if dir_zone_label else ''}</span>
           </div>
+          </div>
         </div>"""
 
     false_by_options = "".join(
@@ -7614,7 +7635,7 @@ def report_weekly_html():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>گزارش هفتگی تیم — {week_label}</title>
+<title>گزارش آلارم‌های تیم — {week_label}</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
   *{{box-sizing:border-box;margin:0;padding:0}}
@@ -7682,11 +7703,22 @@ def report_weekly_html():
   .stat.green:hover{{box-shadow:0 8px 24px var(--green-glow)}}
   .stat.red:hover{{box-shadow:0 8px 24px var(--red-glow)}}
 
-  /* ── Week nav ── */
-  .week-nav{{display:flex;gap:10px;justify-content:center;padding:18px 20px;position:sticky;top:4px;z-index:50}}
-  .week-btn{{padding:10px 26px;border-radius:12px;border:1px solid var(--border2);background:var(--surface);color:var(--muted);text-decoration:none;font-size:13px;font-weight:600;transition:.25s;backdrop-filter:blur(10px)}}
-  .week-btn:hover{{border-color:var(--blue);color:var(--blue);transform:translateY(-2px)}}
-  .week-btn.active{{background:linear-gradient(135deg,var(--blue),var(--purple));border-color:transparent;color:#fff;box-shadow:0 6px 20px var(--blue-glow)}}
+  /* ── Date range nav ── */
+  .range-nav{{max-width:680px;margin:0 auto;padding:14px 20px 4px;position:sticky;top:4px;z-index:50;
+    display:flex;flex-direction:column;gap:10px;align-items:center}}
+  .range-presets{{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}}
+  .preset-btn{{padding:8px 18px;border-radius:12px;border:1px solid var(--border2);background:var(--surface);
+    color:var(--muted);font-size:12px;font-weight:600;cursor:pointer;transition:.25s;font-family:'Inter',Tahoma,sans-serif}}
+  .preset-btn:hover{{border-color:var(--blue);color:var(--blue);transform:translateY(-2px)}}
+  .range-inputs{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:center;
+    background:var(--surface);border:1px solid var(--border2);border-radius:14px;padding:8px 14px;backdrop-filter:blur(10px)}}
+  .range-inputs label{{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);font-weight:600}}
+  .range-inputs input[type="date"]{{padding:7px 10px;border-radius:10px;border:1px solid var(--border2);
+    background:var(--surface2);color:var(--text);font-family:'Inter',Tahoma,sans-serif;font-size:12px;outline:none}}
+  .range-inputs input[type="date"]:focus{{border-color:var(--blue)}}
+  .range-go{{padding:8px 20px;border-radius:10px;border:none;cursor:pointer;font-size:12px;font-weight:700;
+    background:linear-gradient(135deg,var(--blue),var(--purple));color:#fff;box-shadow:0 6px 16px var(--blue-glow)}}
+  .range-go:hover{{transform:translateY(-1px)}}
 
   /* ── Search ── */
   .search-wrap{{max-width:680px;margin:0 auto;padding:0 20px 14px;position:relative;z-index:1}}
@@ -7705,12 +7737,16 @@ def report_weekly_html():
   .list{{padding:10px 20px 40px;max-width:680px;margin:0 auto;position:relative;z-index:1}}
   .card{{border-radius:20px;border:1px solid var(--border);margin-bottom:18px;overflow:hidden;transition:.3s;
          opacity:0;transform:translateY(20px) scale(.98);animation:cardIn .5s ease forwards;
-         background:var(--surface);position:relative}}
+         background:var(--surface);position:relative;display:flex;align-items:stretch}}
   .card:hover{{transform:translateY(-5px) scale(1.01);box-shadow:0 16px 40px var(--blue-glow);border-color:var(--blue)}}
   .card-false:hover{{box-shadow:0 16px 40px var(--red-glow);border-color:var(--red)}}
   .card-glow{{position:absolute;top:-50%;left:-20%;width:60%;height:200%;
     background:radial-gradient(circle,var(--blue-glow),transparent 70%);pointer-events:none;opacity:.5}}
   .card-false .card-glow{{background:radial-gradient(circle,var(--red-glow),transparent 70%)}}
+  .card-inner{{flex:1;min-width:0;position:relative}}
+  .card-num{{flex:0 0 40px;display:flex;align-items:center;justify-content:center;
+    background:var(--surface2);border-left:1px solid var(--border);
+    color:var(--muted);font-family:'Inter',monospace;font-size:14px;font-weight:800}}
 
   .card-header{{display:flex;align-items:center;gap:12px;padding:18px 18px 14px;position:relative;z-index:1}}
   .card-icon{{font-size:26px;width:46px;height:46px;display:flex;align-items:center;justify-content:center;
@@ -7777,7 +7813,7 @@ def report_weekly_html():
 <div class="scroll-dot" id="scrollDot">📈</div>
 <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()">🌙</button>
 <div class="hero">
-  <h1>📋 گزارش هفتگی تیم</h1>
+  <h1>📋 گزارش آلارم‌های تیم</h1>
   <div class="period">{week_label}</div>
   <div class="stats">
     <div class="stat"><div class="num">{len(rows)}</div><div class="lbl2">کل آلارم</div></div>
@@ -7785,10 +7821,19 @@ def report_weekly_html():
     <div class="stat red"><div class="num">{false_count}</div><div class="lbl2">False شده</div></div>
   </div>
 </div>
-<div class="week-nav">
-  <a href="/report/weekly?w=this" class="week-btn {'active' if which=='this' else ''}">📅 این هفته</a>
-  <a href="/report/weekly?w=last" class="week-btn {'active' if which=='last' else ''}">📅 هفته قبل</a>
-</div>
+<form class="range-nav" id="rangeNav" method="get" action="/report/weekly">
+  <div class="range-presets">
+    <button type="button" class="preset-btn" onclick="setRange(0)">📅 این هفته</button>
+    <button type="button" class="preset-btn" onclick="setRange(1)">📅 هفته قبل</button>
+    <button type="button" class="preset-btn" onclick="setRange(2)">🗓️ این ماه</button>
+    <button type="button" class="preset-btn" onclick="setRange(3)">🗓️ ماه قبل</button>
+  </div>
+  <div class="range-inputs">
+    <label>از <input type="date" name="from" id="fromInput" value="{from_value}"></label>
+    <label>تا <input type="date" name="to" id="toInput" value="{to_value}"></label>
+    <button type="submit" class="range-go">نمایش 🔍</button>
+  </div>
+</form>
 <div class="search-wrap">
   <input type="text" id="searchBox" class="search-input" placeholder="🔍 جستجو بر اساس مسئول، نماد، تگ یا سازنده..." oninput="filterCards()">
   <select id="filterSelect" class="search-select" onchange="filterCards()">
@@ -7809,6 +7854,34 @@ def report_weekly_html():
 </div>
 <div class="footer">آخرین بروزرسانی: {now_dt.strftime('%H:%M — %d/%m/%Y')}</div>
 <script>
+  // miyanbor‌های بازه تاریخ
+  function _fmtDate(d) {{
+    const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), day = String(d.getDate()).padStart(2,'0');
+    return `${{y}}-${{m}}-${{day}}`;
+  }}
+  function setRange(type) {{
+    const now = new Date();
+    let from, to;
+    if (type === 0) {{ // این هفته: شنبه تا امروز
+      const diffToSat = (now.getDay() - 6 + 7) % 7;
+      from = new Date(now); from.setDate(now.getDate() - diffToSat);
+      to = now;
+    }} else if (type === 1) {{ // هفته قبل
+      const diffToSat = (now.getDay() - 6 + 7) % 7;
+      const thisWeekStart = new Date(now); thisWeekStart.setDate(now.getDate() - diffToSat);
+      to = new Date(thisWeekStart); to.setDate(thisWeekStart.getDate() - 1);
+      from = new Date(thisWeekStart); from.setDate(thisWeekStart.getDate() - 7);
+    }} else if (type === 2) {{ // این ماه
+      from = new Date(now.getFullYear(), now.getMonth(), 1);
+      to = now;
+    }} else if (type === 3) {{ // ماه قبل
+      from = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      to = new Date(now.getFullYear(), now.getMonth(), 0);
+    }}
+    document.getElementById('fromInput').value = _fmtDate(from);
+    document.getElementById('toInput').value = _fmtDate(to);
+    document.getElementById('rangeNav').submit();
+  }}
   // scroll progress — chart line style
   window.addEventListener('scroll', () => {{
     const h = document.documentElement;
