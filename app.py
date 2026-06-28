@@ -4577,7 +4577,12 @@ def check_alerts():
                     a["active"] = False
                     a["fired_at"] = now
                     a["fired_price"] = cur
+                    alarm_num_tag = _make_alarm_tag(sym)
+                    a["tag"] = alarm_num_tag
                     fired.append(a["id"])
+                    # 🔒 فوری و سینک قبل از هرکاری (ارسال پیام/تعیین مسئول) تو Supabase ذخیره می‌کنیم —
+                    # تا اگه سرور وسط ارسال پیام‌ها کرش/ریستارت کرد، این آلارم already-fired بمونه و دوباره فایر نشه
+                    save_alert_fired(a)
                     if token and cids:
                         comment = a.get("comment", "")
                         if str(YOUR_CHAT_ID) in str(comment):
@@ -4594,7 +4599,6 @@ def check_alerts():
                         cmt = f"\n💬 <i>{comment}</i>" if comment else ""
                         dist = calc_dist_str(sym, atype, cur, tgt)
                         private_label = "\n\n🔒 <i>آلارم شخصی — فقط برای شما ارسال شده</i>" if a.get("is_private") else ""
-                        alarm_num_tag = _make_alarm_tag(sym)
                         creator_tag = "#" + re.sub(r'[^\w]', '_', creator).strip('_')
                         # ── تعیین مسئول تریگر — فقط برای آلارم‌های تیمی، آلارم شخصی وارد تقسیم شیفت نمی‌شه ──
                         if a.get("is_private"):
@@ -4639,10 +4643,6 @@ def check_alerts():
                             fired_cid_to_mid["__text__"] = fired_msg
                             _fired_msg_ids[a["id"]] = fired_cid_to_mid
                             threading.Thread(target=_sb_save_fired_msgs, args=(a["id"], fired_cid_to_mid), daemon=True).start()
-                        # ذخیره tag روی آلارم
-                        a["tag"] = alarm_num_tag
-                        # فوری توی Supabase آپدیت کن
-                        save_alert_fired(a)
             if fired:
                 arch = data.get("archive", [])
                 for fid in fired:
