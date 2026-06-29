@@ -645,7 +645,7 @@ SHIFT_MORNING = {
 }
 SHIFT_EVENING = {
     "start": 16, "end": 20,
-    "members": [ "فرهاد", "علی", "پیمان"]
+    "members": [ "فرهاد", "علی", "پیمان" , "مسعود"]
 }
 
 def _is_weekend_tehran():
