@@ -3540,12 +3540,13 @@ def _do_update(upd, token):
                                     except Exception as e:
                                         print(f"[false] check exc: {e}")
 
-                                threading.Thread(
-                                    target=_sb_false_assignment,
-                                    args=(target_aid_false, sender_name_false, false_reason),
-                                    daemon=True).start()
-                                threading.Thread(target=lambda: _rebuild_active_assign_count(
-                                    _sb_load_active_assignments()), daemon=True).start()
+                                def _false_then_rebuild(aid=target_aid_false, sender=sender_name_false, reason=false_reason):
+                                    # اول false رو تو Supabase ذخیره کن، بعد شمارش رو بازسازی کن —
+                                    # اگه این دوتا موازی اجرا بشن، ممکنه rebuild قبل از ثبت is_active=False
+                                    # از Supabase بخونه و شمارش طرف false‌کننده درست کم نشه (race condition)
+                                    _sb_false_assignment(aid, sender, reason)
+                                    _rebuild_active_assign_count(_sb_load_active_assignments())
+                                threading.Thread(target=_false_then_rebuild, daemon=True).start()
                                 tag_txt = f" <b>{false_tag}</b>" if false_tag else ""
                                 reason_line = f"\n📝 علت: {false_reason}" if false_reason else ""
                                 now_label = now_pretty()
