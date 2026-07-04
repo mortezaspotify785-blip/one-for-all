@@ -12,6 +12,7 @@ TEHRAN = pytz.timezone("Asia/Tehran")
 
 # ==================== متغیرهای محیطی ====================
 ALERTS_FILE = "alerts.json"
+FIRED_BACKUP_FILE = "fired_backup.json"  # لایه‌ی دفاعی دوم — جلوگیری از فایر مجدد بعد از ری‌استارت اگه Supabase قطع بود
 JOURNAL_FILE = "journal_data.json"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 BOT_TOKEN_ENV = os.environ.get("BOT_TOKEN", "")
@@ -259,11 +260,66 @@ def save_alerts(data):
         threading.Thread(target=_bg, daemon=True).start()
 
 def save_alert_fired(a):
-    """وقتی آلارم fire میشه — ردیف رو آپدیت کن و cache رو پاک کن تا archive درست لود بشه"""
+    """
+    وقتی آلارم fire میشه — ردیف رو آپدیت کن و cache رو پاک کن تا archive درست لود بشه.
+    این ذخیره‌سازی حیاتیه: اگه fail بشه و سرور همون لحظه ری‌استارت/دیپلوی بشه،
+    آلارم دوباره fired_at ندار می‌مونه و بعد از بالا اومدن دوباره فایر می‌شه.
+    برای همین با چند تلاش (retry) کار می‌کنیم و هم‌زمان یه بک‌آپ محلی فوری هم می‌زنیم.
+    """
     global _cache_alerts
-    _sb_upsert_alert(a)
+    ok = _sb_upsert_alert_retry(a, max_tries=3)
+    if not ok:
+        print(f"[alerts] ⚠️ CRITICAL: fired state برای {a.get('id')} بعد از چند تلاش تو Supabase ذخیره نشد!")
+    # بک‌آپ محلی فوری و مستقل از Supabase — حتی اگه Supabase کامل قطع باشه
+    try:
+        _local_mark_fired_backup(a)
+    except Exception as e:
+        print(f"[alerts] local fired backup error: {e}")
     # cache رو پاک کن تا دفعه بعد از Supabase بخونه و archive آپدیت بشه
     _cache_alerts = None
+
+def _sb_upsert_alert_retry(a, max_tries=3):
+    """
+    _sb_upsert_alert رو با چند تلاش صدا بزن و مطمئن شو fired_at واقعاً ثبت شده —
+    با یه GET تأیید می‌کنیم، نه فقط status code ارسال.
+    """
+    if not SUPABASE_KEY:
+        return True  # بدون Supabase چیزی برای تایید نیست، local backup کافیه
+    for attempt in range(1, max_tries + 1):
+        _sb_upsert_alert(a)
+        try:
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/alerts?id=eq.{a['id']}&select=fired_at,active",
+                headers=_sb_h(), timeout=8)
+            if r.status_code == 200:
+                rows = r.json()
+                if rows and rows[0].get("fired_at"):
+                    return True
+        except Exception as e:
+            print(f"[alerts] verify fired attempt {attempt} exc: {e}")
+        print(f"[alerts] fired upsert تلاش {attempt}/{max_tries} تایید نشد — دوباره امتحان می‌کنیم")
+        time.sleep(0.5)
+    return False
+
+def _local_mark_fired_backup(a):
+    """
+    یه فایل کوچیک محلی جدا از alerts.json که فقط آیدی آلارم‌های fired رو نگه می‌داره —
+    حتی اگه Supabase کامل قطع باشه، بعد از ری‌استارت این فایل خونده می‌شه تا
+    از فایر مجدد جلوگیری بشه (لایه‌ی دفاعی دوم).
+    """
+    fired_ids = set()
+    if os.path.exists(FIRED_BACKUP_FILE):
+        try:
+            with open(FIRED_BACKUP_FILE, "r", encoding="utf-8") as f:
+                fired_ids = set(json.load(f))
+        except Exception:
+            fired_ids = set()
+    fired_ids.add(str(a["id"]))
+    try:
+        with open(FIRED_BACKUP_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(fired_ids), f)
+    except Exception as e:
+        print(f"[alerts] local fired backup write error: {e}")
 
 # =====================================================================
 # Supabase
@@ -675,6 +731,11 @@ _active_assign_count: dict = {}
 # جلوگیری از race condition در /False — اگه یه آلارم داره false میشه، دیگران صبر کنن
 _false_in_progress: set = set()
 _false_in_progress_lock = threading.Lock()
+
+# جلوگیری از دابل-ack — اگه دکمه «دیدم» دوبار کلیک بشه (دابل‌تپ یا کندی شبکه)
+# قبل از این‌که پیام ادیت و دکمه پاک بشه، این از ثبت تکراری جلوگیری می‌کنه
+_ack_done: set = set()
+_ack_lock = threading.Lock()
 
 # ─── Supabase helpers ────────────────────────────────────────────────
 
@@ -1767,52 +1828,72 @@ def _do_update(upd, token):
                         if not ack_expected_id or clicker_id != ack_expected_id:
                             answer_callback(token_cbq, cbq_id, "⛔ این دکمه فقط برای مسئول تریگره")
                         else:
-                            answer_callback(token_cbq, cbq_id, "✅ ثبت شد")
-                            ack_name = TEAM_ID_TO_NAME.get(clicker_id, "")
-                            ack_time_label = now_pretty()
+                            # جلوگیری از دابل-ack — اگه دابل‌تپ شده یا قبلاً پردازش شده، دومی رو نادیده بگیر
+                            with _ack_lock:
+                                _already_acked = ack_aid in _ack_done
+                                if not _already_acked:
+                                    _ack_done.add(ack_aid)
+                            if _already_acked:
+                                answer_callback(token_cbq, cbq_id, "✅ قبلاً ثبت شده")
+                            else:
+                                answer_callback(token_cbq, cbq_id, "✅ ثبت شد")
+                                ack_name = TEAM_ID_TO_NAME.get(clicker_id, "")
+                                ack_time_label = now_pretty()
 
-                            def _do_ack(aid=ack_aid, name=ack_name, tlabel=ack_time_label):
-                                # ذخیره در Supabase — بدون دست زدن به بقیه فیلدها
-                                if SUPABASE_KEY:
-                                    try:
-                                        requests.patch(
-                                            f"{SUPABASE_URL}/rest/v1/alarm_assignments?id=eq.{aid}",
-                                            headers={**_sb_h(), "Prefer": "return=minimal"},
-                                            json={"ack_at": now_teh(), "ack_by": name},
-                                            timeout=8)
-                                    except Exception as e:
-                                        print(f"[ack] save exc: {e}")
-                                # ادیت پیام برای همه‌ی چت‌هایی که این آلارم توشون ارسال شده
-                                tok_ack, _, _ = _get_token_and_cids()
-                                msg_map_ack = _fired_msg_ids.get(aid, {})
-                                base_text = msg_map_ack.get("__text__", "")
-                                if not base_text:
-                                    return
-                                ack_line = f"\n✅ <b>{name}</b> قبول کرد در ساعت {tlabel}"
-                                new_text = base_text + ack_line
-                                # هر آلارم یه نماد ثابت داره — از تگ متن استخراج می‌کنیم نه از هر پیام
-                                sym_ack = _extract_symbol_from_tag(msg_map_ack.get("__tag__", ""))
-                                for tc_ack, tm_ack in msg_map_ack.items():
-                                    if tc_ack in ("__tag__", "__text__"):
-                                        continue
-                                    new_kb = {"inline_keyboard": [[
-                                        {"text": "⏰ هشدار دوره‌ای", "callback_data": f"set_reminder:{tc_ack}:{sym_ack}"}
-                                    ]]}
-                                    try:
-                                        requests.post(
-                                            f"https://api.telegram.org/bot{tok_ack}/editMessageText",
-                                            json={"chat_id": tc_ack, "message_id": tm_ack,
-                                                  "text": new_text, "parse_mode": "HTML",
-                                                  "reply_markup": new_kb},
-                                            timeout=8, headers=H)
-                                    except Exception as e:
-                                        print(f"[ack] edit exc: {e}")
-                                # آپدیت متن ذخیره‌شده تا اگه دوباره چیزی edit بشه این تغییر از دست نره
-                                msg_map_ack["__text__"] = new_text
-                                _fired_msg_ids[aid] = msg_map_ack
-                                threading.Thread(target=_sb_save_fired_msgs, args=(aid, msg_map_ack), daemon=True).start()
+                                def _do_ack(aid=ack_aid, name=ack_name, tlabel=ack_time_label):
+                                    # لایه‌ی دوم ایمنی — حتی اگه سرور بین دو کلیک ری‌استارت شده باشه
+                                    # (که _ack_done در حافظه رو ریست می‌کنه)، از خود دیتابیس هم چک کن
+                                    if SUPABASE_KEY:
+                                        try:
+                                            r_chk_ack = requests.get(
+                                                f"{SUPABASE_URL}/rest/v1/alarm_assignments?id=eq.{aid}&select=ack_at",
+                                                headers=_sb_h(), timeout=8)
+                                            if r_chk_ack.status_code == 200:
+                                                chk_rows_ack = r_chk_ack.json()
+                                                if chk_rows_ack and chk_rows_ack[0].get("ack_at"):
+                                                    print(f"[ack] {aid} از قبل تو DB ack شده بود — skip")
+                                                    return
+                                        except Exception as e:
+                                            print(f"[ack] pre-check exc: {e}")
+                                        try:
+                                            requests.patch(
+                                                f"{SUPABASE_URL}/rest/v1/alarm_assignments?id=eq.{aid}",
+                                                headers={**_sb_h(), "Prefer": "return=minimal"},
+                                                json={"ack_at": now_teh(), "ack_by": name},
+                                                timeout=8)
+                                        except Exception as e:
+                                            print(f"[ack] save exc: {e}")
+                                    # ادیت پیام برای همه‌ی چت‌هایی که این آلارم توشون ارسال شده
+                                    tok_ack, _, _ = _get_token_and_cids()
+                                    msg_map_ack = _fired_msg_ids.get(aid, {})
+                                    base_text = msg_map_ack.get("__text__", "")
+                                    if not base_text:
+                                        return
+                                    ack_line = f"\n✅ <b>{name}</b> قبول کرد در ساعت {tlabel}"
+                                    new_text = base_text + ack_line
+                                    # هر آلارم یه نماد ثابت داره — از تگ متن استخراج می‌کنیم نه از هر پیام
+                                    sym_ack = _extract_symbol_from_tag(msg_map_ack.get("__tag__", ""))
+                                    for tc_ack, tm_ack in msg_map_ack.items():
+                                        if tc_ack in ("__tag__", "__text__"):
+                                            continue
+                                        new_kb = {"inline_keyboard": [[
+                                            {"text": "⏰ هشدار دوره‌ای", "callback_data": f"set_reminder:{tc_ack}:{sym_ack}"}
+                                        ]]}
+                                        try:
+                                            requests.post(
+                                                f"https://api.telegram.org/bot{tok_ack}/editMessageText",
+                                                json={"chat_id": tc_ack, "message_id": tm_ack,
+                                                      "text": new_text, "parse_mode": "HTML",
+                                                      "reply_markup": new_kb},
+                                                timeout=8, headers=H)
+                                        except Exception as e:
+                                            print(f"[ack] edit exc: {e}")
+                                    # آپدیت متن ذخیره‌شده تا اگه دوباره چیزی edit بشه این تغییر از دست نره
+                                    msg_map_ack["__text__"] = new_text
+                                    _fired_msg_ids[aid] = msg_map_ack
+                                    threading.Thread(target=_sb_save_fired_msgs, args=(aid, msg_map_ack), daemon=True).start()
 
-                            threading.Thread(target=_do_ack, daemon=True).start()
+                                threading.Thread(target=_do_ack, daemon=True).start()
 
                     elif cbq_data.startswith("set_reminder:"):
                         # set_reminder:cid:SYM — از دکمه کنار الارم
@@ -4307,6 +4388,16 @@ def _fetch_with_timeout(fn, *args, timeout=PRICE_FETCH_TIMEOUT):
         print(f"[check] price fetch error: {e}")
         return None
 
+def _load_fired_backup_ids() -> set:
+    """لود آیدی‌های fired از فایل بک‌آپ محلی — لایه‌ی دفاعی دوم مستقل از Supabase"""
+    if os.path.exists(FIRED_BACKUP_FILE):
+        try:
+            with open(FIRED_BACKUP_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
 def check_alerts():
     global _loop_count
     while True:
@@ -4315,7 +4406,11 @@ def check_alerts():
             global _cache_alerts
             _cache_alerts = None
             token, cids, data = _get_token_and_cids()
-            active = [a for a in data.get("alerts", []) if a.get("active") and str(a["id"]) not in _deleted_ids and not a.get("fired_at")]
+            _fired_backup_ids = _load_fired_backup_ids()
+            active = [a for a in data.get("alerts", [])
+                      if a.get("active") and str(a["id"]) not in _deleted_ids
+                      and not a.get("fired_at")
+                      and str(a["id"]) not in _fired_backup_ids]
             if not active:
                 save_alerts(data)
                 time.sleep(60)
