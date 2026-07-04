@@ -7514,7 +7514,7 @@ def report_weekly_html():
   .stat.red:hover{{box-shadow:0 8px 24px var(--red-glow)}}
 
   /* ── Date range nav ── */
-  .range-nav{{max-width:680px;margin:0 auto;padding:14px 20px 4px;position:sticky;top:4px;z-index:50;
+  .range-nav{{max-width:680px;margin:0 auto;padding:14px 20px 4px;
     display:flex;flex-direction:column;gap:10px;align-items:center}}
   .range-presets{{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}}
   .preset-btn{{padding:8px 18px;border-radius:12px;border:1px solid var(--border2);background:var(--surface);
