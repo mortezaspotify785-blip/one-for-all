@@ -635,59 +635,43 @@ def _make_alarm_tag(sym: str) -> str:
     n = _sb_next_sym_counter(sym)
     return f"#{sym}{n}"
 
+def _extract_symbol_from_tag(tag: str) -> str:
+    """از تگ آلارم (مثلاً #XAUUSD7) نماد رو استخراج کن (XAUUSD)"""
+    m = re.match(r'^#?([A-Za-z]+)\d*$', tag or "")
+    return m.group(1) if m else ""
+
 # =====================================================================
-# 📋 سیستم تقسیم مسئولیت آلارم‌ها بین اعضای تیم
+# 📋 سیستم تقسیم مسئولیت آلارم‌ها بین اعضای تیم (بدون شیفت — رندوم عادلانه)
 # =====================================================================
 
-SHIFT_MORNING = {
-    "start": 8, "end": 16,
-   "members": ["اتابک", "مهران"]
+# همه اعضای تیم + آیدی عددی تلگرام‌شون (برای تشخیص دکمه‌ی مخصوص «دیدم»)
+TEAM_MEMBERS = ["اتابک", "مهران", "فرهاد", "علی", "پیمان", "مسعود"]
+
+TEAM_MEMBER_IDS = {
+    "مسعود": "109419675",
+    "پیمان": "5089282711",
+    "علی":   "138116289",
+    "اتابک": "349639401",
+    "مهران": "117005892",
+    "فرهاد": "107387610",
 }
-SHIFT_EVENING = {
-    "start": 16, "end": 20,
-    "members": [ "فرهاد", "علی", "پیمان" , "مسعود"]
-}
+# معکوس: آیدی → اسم (برای چک سریع از from.id در callback)
+TEAM_ID_TO_NAME = {v: k for k, v in TEAM_MEMBER_IDS.items()}
+
+# نام‌هایی که باید در تقسیم عادلانه «ترجیح داده نشن» مگه مجبور باشیم
+DEPRIORITIZED_MEMBER = "مسعود"
+# بازه ساعتی تهران که این عضو تقریباً هیچ‌وقت نباید بگیره مگه بقیه مشغول باشن
+DEPRIORITIZED_BLOCK_START = 8
+DEPRIORITIZED_BLOCK_END = 12
 
 def _is_weekend_tehran():
-    """شنبه (5) و یکشنبه (6) بازار بسته — weekday: 0=Mon ... 5=Sat, 6=Sun"""
+    """شنبه (5) و یکشنبه (6) — فقط برای نمایش/گزارش، دیگه تاثیری در تقسیم نداره"""
     return datetime.now(TEHRAN).weekday() in (5, 6)
-
-def _get_current_shift():
-    """
-    شیفت فعلی بر اساس ساعت تهران.
-    شنبه/یکشنبه همیشه night (بدون مسئول).
-    """
-    if _is_weekend_tehran():
-        return "night"
-    h = datetime.now(TEHRAN).hour
-    if SHIFT_MORNING["start"] <= h < SHIFT_MORNING["end"]:
-        return "morning"
-    if SHIFT_EVENING["start"] <= h < SHIFT_EVENING["end"]:
-        return "evening"
-    return "night"
-
-def _get_shift_members(shift_name):
-    if shift_name == "morning": return SHIFT_MORNING["members"]
-    if shift_name == "evening": return SHIFT_EVENING["members"]
-    return []
-
-def _next_monday_8am():
-    """دوشنبه ۸ صبح بعدی — برای آلارم‌های آخر هفته"""
-    now_dt = datetime.now(TEHRAN)
-    days_ahead = (7 - now_dt.weekday()) % 7  # دوشنبه = 0
-    if days_ahead == 0 and now_dt.hour >= 8:
-        days_ahead = 7
-    target = now_dt.replace(hour=8, minute=0, second=0, microsecond=0)
-    target = target + timedelta(days=days_ahead)
-    return target
 
 # { member_name: count_of_active_assignments }  — in-memory cache
 _active_assign_count: dict = {}
 
 # جلوگیری از double-handover: startup و scheduler هر کدوم فقط یه بار اجرا کنن
-_startup_handover_done: dict = {}   # {"8am": True, "16": True, "20": True}
-_startup_handover_lock = threading.Lock()
-
 # جلوگیری از race condition در /False — اگه یه آلارم داره false میشه، دیگران صبر کنن
 _false_in_progress: set = set()
 _false_in_progress_lock = threading.Lock()
@@ -720,37 +704,6 @@ def _sb_save_assignment(alarm_id: str, alarm_tag: str, assignee: str, shift: str
             print(f"[assign] save error: {r.status_code} {r.text[:80]}")
     except Exception as e:
         print(f"[assign] save exc: {e}")
-
-def _sb_handover_assignment(alarm_id: str, alarm_tag: str, assignee: str, new_shift: str):
-    """
-    آپدیت assignment هنگام handover بین شیفت‌ها.
-    فقط assigned_to و shift رو عوض می‌کنه — false_at/false_by/false_history دست نمی‌زنه.
-    """
-    if not SUPABASE_KEY: return
-    try:
-        r = requests.patch(
-            f"{SUPABASE_URL}/rest/v1/alarm_assignments?id=eq.{alarm_id}",
-            headers={**_sb_h(), "Prefer": "return=minimal"},
-            json={"assigned_to": assignee, "shift": new_shift},
-            timeout=8)
-        if r.status_code not in (200, 204):
-            print(f"[assign] handover error: {r.status_code} {r.text[:80]}")
-    except Exception as e:
-        print(f"[assign] handover exc: {e}")
-
-def _sb_update_shift(alarm_id: str, new_shift: str):
-    """آپدیت shift آلارم در Supabase — برای انتقال بین شیفت‌ها (بدون تغییر assigned_to)"""
-    if not SUPABASE_KEY: return
-    try:
-        r = requests.patch(
-            f"{SUPABASE_URL}/rest/v1/alarm_assignments?id=eq.{alarm_id}",
-            headers={**_sb_h(), "Prefer": "return=minimal"},
-            json={"shift": new_shift},
-            timeout=8)
-        if r.status_code not in (200, 204):
-            print(f"[assign] update_shift error: {r.status_code} {r.text[:80]}")
-    except Exception as e:
-        print(f"[assign] update_shift exc: {e}")
 
 def _sb_false_assignment(alarm_id: str, false_by: str, reason: str = ""):
     """
@@ -809,20 +762,6 @@ def _sb_load_active_assignments():
         print(f"[assign] load exc: {e}")
     return []
 
-def _sb_load_pending_shifts(shifts: list):
-    """لود آلارم‌های active با shift های مشخص از Supabase"""
-    if not SUPABASE_KEY: return []
-    try:
-        shift_filter = ",".join(f'"{s}"' for s in shifts)
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/alarm_assignments?is_active=eq.true&shift=in.({shift_filter})&select=*",
-            headers=_sb_h(), timeout=10)
-        if r.status_code == 200:
-            return r.json()
-    except Exception as e:
-        print(f"[assign] load_pending exc: {e}")
-    return []
-
 def _rebuild_active_assign_count(rows):
     """بازسازی count از Supabase rows — فقط assigned آلارم‌ها"""
     global _active_assign_count
@@ -833,17 +772,66 @@ def _rebuild_active_assign_count(rows):
             _active_assign_count[name] = _active_assign_count.get(name, 0) + 1
     print(f"[assign] active counts: {_active_assign_count}")
 
-# ─── انتخاب مسئول ────────────────────────────────────────────────────
+# ─── انتخاب مسئول (رندوم عادلانه، بدون شیفت) ─────────────────────────
 
 def _pick_assignee(members: list) -> str:
     """
-    از بین اعضا کسی رو انتخاب کن که کمترین آلارم فعال داره.
+    از بین اعضا کسی رو انتخاب کن که کمترین آلارم فعال داره (عدالت).
     اگه چند نفر مساوی دارن، رندوم از بین اونها انتخاب کن.
+
+    استثنا: عضو DEPRIORITIZED_MEMBER تا حد امکان کنار گذاشته می‌شه —
+    فقط وقتی انتخاب می‌شه که واقعاً نوبتش شده (یعنی بقیه مشغول‌ترن یا هم‌سطح
+    مساوی‌ان و چاره‌ای نیست). تو بازه‌ی DEPRIORITIZED_BLOCK_START تا
+    DEPRIORITIZED_BLOCK_END فقط زمانی بهش می‌دیم که همه‌ی بقیه‌ی اعضا
+    خودشون یه آلارم فعال داشته باشن (یعنی واقعاً مجبوریم).
     """
     import random
     if not members:
         return ""
     counts = {m: _active_assign_count.get(m, 0) for m in members}
+
+    others = [m for m in members if m != DEPRIORITIZED_MEMBER]
+    has_deprioritized = DEPRIORITIZED_MEMBER in members
+
+    h_now = datetime.now(TEHRAN).hour
+    in_block_hours = DEPRIORITIZED_BLOCK_START <= h_now < DEPRIORITIZED_BLOCK_END
+
+    if has_deprioritized and others:
+        min_others = min(counts[m] for m in others)
+        min_dep = counts[DEPRIORITIZED_MEMBER]
+
+        if in_block_hours:
+            # تو این بازه فقط اگه همه‌ی بقیه حداقل یه آلارم فعال دارن (یعنی
+            # کمترین‌شون >= 1) به مسعود می‌دیم — یعنی واقعاً مجبوریم.
+            forced = min_others >= 1
+            if not forced:
+                candidates = [m for m in others if counts[m] == min_others]
+                chosen = random.choice(candidates)
+                _active_assign_count[chosen] = _active_assign_count.get(chosen, 0) + 1
+                return chosen
+            # مجبوریم: بین کسایی که کمترین آلارم رو دارن انتخاب کن (شاید همون دپریوریتایزد باشه)
+            min_count = min(counts.values())
+            candidates = [m for m, c in counts.items() if c == min_count]
+            chosen = random.choice(candidates)
+            _active_assign_count[chosen] = _active_assign_count.get(chosen, 0) + 1
+            return chosen
+        else:
+            # خارج از بازه: فقط وقتی به دپریوریتایزد بده که واقعاً کمترین بار رو
+            # داره و بقیه مساوی یا بیشترن — یعنی رعایت عدالت واقعی، بدون بونس
+            # اضافه براش. اگه بقیه کمتر یا مساوی دارن، اول به اونا بده.
+            if min_others <= min_dep:
+                candidates = [m for m in others if counts[m] == min_others]
+                chosen = random.choice(candidates)
+                _active_assign_count[chosen] = _active_assign_count.get(chosen, 0) + 1
+                return chosen
+            else:
+                min_count = min(counts.values())
+                candidates = [m for m, c in counts.items() if c == min_count]
+                chosen = random.choice(candidates)
+                _active_assign_count[chosen] = _active_assign_count.get(chosen, 0) + 1
+                return chosen
+
+    # حالت عادی (بدون عضو دپریوریتایزد در لیست) — عادلانه‌ی خالص
     min_count = min(counts.values())
     candidates = [m for m, c in counts.items() if c == min_count]
     chosen = random.choice(candidates)
@@ -853,247 +841,29 @@ def _pick_assignee(members: list) -> str:
 def _get_assignee_for_alarm(alarm_id: str, alarm_tag: str, fired_at: str,
                             symbol: str = "", target_price: float = 0, created_by: str = "") -> tuple:
     """
-    مسئول آلارم رو تعیین کن.
-    شب / شنبه / یکشنبه → ("", "night")  بدون مسئول
+    مسئول آلارم رو بین کل اعضای تیم به‌صورت رندومِ عادلانه تعیین کن —
+    مستقل از ساعت/شیفت. هر آلارم تیمی همیشه یه مسئول می‌گیره.
     """
-    shift = _get_current_shift()
-    members = _get_shift_members(shift)
-    if not members:
-        threading.Thread(
-            target=_sb_save_assignment,
-            args=(alarm_id, alarm_tag, "", "night", fired_at),
-            kwargs={"symbol": symbol, "target_price": target_price, "created_by": created_by},
-            daemon=True
-        ).start()
-        return ("", "night")
-    assignee = _pick_assignee(members)
+    assignee = _pick_assignee(TEAM_MEMBERS)
     threading.Thread(
         target=_sb_save_assignment,
-        args=(alarm_id, alarm_tag, assignee, shift, fired_at),
+        args=(alarm_id, alarm_tag, assignee, "", fired_at),
         kwargs={"symbol": symbol, "target_price": target_price, "created_by": created_by},
         daemon=True
     ).start()
-    return (assignee, shift)
-
-# ─── تابع مشترک ارسال reply تقسیم ──────────────────────────────────
-
-def _send_handover_replies(rows: list, target_members: list, label: str):
-    """
-    برای هر آلارم در rows یه reply به همه چت‌ها بفرست و assignee تعیین کن.
-    label: برچسب نمایشی مثل 'تقسیم آلارم صبح' یا 'تقسیم آلارم شب'
-    """
-    if not rows: return
-    token, cids, _ = _get_token_and_cids()
-    for row in rows:
-        aid = row.get("id")
-        tag = row.get("alarm_tag", "")
-        old_assignee = row.get("assigned_to", "")
-        assignee = _pick_assignee(target_members) if target_members else ""
-        # کاهش شمارش مسئول قبلی (دیگه این آلارم رو نداره)
-        if old_assignee and old_assignee in _active_assign_count:
-            _active_assign_count[old_assignee] = max(0, _active_assign_count[old_assignee] - 1)
-        if assignee:
-            reply_text = f"🔄 <b>{label}</b>\n\n{tag}\n👤 مسئول: <b>{assignee}</b>"
-            new_shift = "morning" if target_members == SHIFT_MORNING["members"] else "evening"
-        else:
-            reply_text = f"🔄 <b>{label}</b>\n\n{tag}\n⏳ تقسیم دوشنبه ۸ صبح"
-            new_shift = "weekend_pending"
-        # ارسال reply به همه چت‌ها
-        msg_map = _fired_msg_ids.get(aid, {})
-        for tc, tm in msg_map.items():
-            if tc in ("__tag__", "__text__"): continue
-            try:
-                requests.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={"chat_id": tc, "text": reply_text,
-                          "parse_mode": "HTML", "reply_to_message_id": tm},
-                    timeout=8, headers=H)
-            except: pass
-        # آپدیت shift و assignee در Supabase — بدون دست زدن به false fields
-        threading.Thread(
-            target=lambda a=aid, s=new_shift, asn=assignee, tg=tag: (
-                _sb_handover_assignment(a, tg, asn, s)
-            ),
-            daemon=True
-        ).start()
-    print(f"[assign] {label}: {len(rows)} آلارم تقسیم شد")
-
-# ─── Scheduler اصلی ──────────────────────────────────────────────────
-
-def _assignment_scheduler():
-    """
-    یه scheduler واحد که منتظر ساعت‌های کلیدی میمونه:
-    ۸ صبح (روزهای کاری)  — تقسیم آلارم‌های شب/عصر/آخر هفته
-    ۱۶                    — انتقال آلارم‌های صبح به شیفت عصر
-    ۲۰                    — انتقال آلارم‌های عصر به شب
-    دوشنبه ۸ صبح         — تقسیم آلارم‌های آخر هفته
-    """
-    while True:
-        try:
-            now_dt = datetime.now(TEHRAN)
-            weekday = now_dt.weekday()  # 0=Mon ... 5=Sat, 6=Sun
-            h = now_dt.hour
-
-            # ── محاسبه نزدیک‌ترین event بعدی ──────────────────────
-            candidates = []
-
-            # ۸ صبح روزهای کاری (دوشنبه تا جمعه)
-            for d in range(7):
-                t = now_dt.replace(hour=8, minute=0, second=0, microsecond=0) + timedelta(days=d)
-                if t > now_dt and t.weekday() not in (5, 6):
-                    candidates.append(("8am", t))
-                    break
-
-            # ۱۶ روزهای کاری
-            for d in range(7):
-                t = now_dt.replace(hour=16, minute=0, second=0, microsecond=0) + timedelta(days=d)
-                if t > now_dt and t.weekday() not in (5, 6):
-                    candidates.append(("16", t))
-                    break
-
-            # ۲۰ روزهای کاری
-            for d in range(7):
-                t = now_dt.replace(hour=20, minute=0, second=0, microsecond=0) + timedelta(days=d)
-                if t > now_dt and t.weekday() not in (5, 6):
-                    candidates.append(("20", t))
-                    break
-
-            if not candidates:
-                time.sleep(300)
-                continue
-
-            # نزدیک‌ترین event
-            event_name, target_dt = min(candidates, key=lambda x: x[1])
-            wait_sec = (target_dt - now_dt).total_seconds()
-            print(f"[assign] scheduler: {event_name} — {wait_sec/3600:.1f} ساعت دیگه ({target_dt.strftime('%a %H:%M')})")
-            time.sleep(max(wait_sec, 0))
-
-            # ── بررسی missed event بعد از restart (grace window 10 دقیقه) ──
-            # اگه سرور restart شده و event در ۱۰ دقیقه گذشته miss شده، همین الان اجرا کن
-            _GRACE_SEC = 600
-            now_after_sleep = datetime.now(TEHRAN)
-            if now_after_sleep.weekday() not in (5, 6):
-                for _mh, _me in [(8, "8am"), (16, "16"), (20, "20")]:
-                    _mt = now_after_sleep.replace(hour=_mh, minute=0, second=0, microsecond=0)
-                    _diff = (now_after_sleep - _mt).total_seconds()
-                    if 0 < _diff <= _GRACE_SEC and event_name != _me:
-                        print(f"[assign] ⚠️ event {_me} در {_diff:.0f} ثانیه پیش miss شده — اجرای فوری")
-                        event_name = _me
-                        break
-
-            # ── اجرای event ────────────────────────────────────────
-            # چک کن startup این event رو قبلاً اجرا کرده یا نه (جلوگیری از double-handover)
-            with _startup_handover_lock:
-                already_done = _startup_handover_done.pop(event_name, False)
-            if already_done:
-                print(f"[assign] scheduler: {event_name} قبلاً در startup اجرا شده — skip")
-                continue
-
-            if event_name == "8am":
-                # تقسیم همه آلارم‌های باز: night, evening_handover, weekend_pending
-                rows = _sb_load_pending_shifts(["night", "evening_handover", "weekend_pending", "evening"])
-                if rows:
-                    _send_handover_replies(rows, SHIFT_MORNING["members"], "تقسیم آلارم شب")
-                    # rebuild count بعد از تقسیم
-                    threading.Thread(target=lambda: _rebuild_active_assign_count(
-                        _sb_load_active_assignments()), daemon=True).start()
-                else:
-                    print("[assign] ۸ صبح: آلارم باز برای تقسیم نبود")
-
-            elif event_name == "16":
-                # انتقال آلارم‌های صبح که False نخوردن به شیفت عصر
-                rows = _sb_load_pending_shifts(["morning", "morning_handover"])
-                if rows:
-                    _send_handover_replies(rows, SHIFT_EVENING["members"], "انتقال از شیفت صبح")
-                    threading.Thread(target=lambda: _rebuild_active_assign_count(
-                        _sb_load_active_assignments()), daemon=True).start()
-                else:
-                    print("[assign] ۱۶: آلارم صبحی برای انتقال نبود")
-
-            elif event_name == "20":
-                # انتقال آلارم‌های عصر به night — بدون reply، فردا ۸ صبح تقسیم میشن
-                rows = _sb_load_pending_shifts(["evening", "evening_handover"])
-                if rows:
-                    for row in rows:
-                        threading.Thread(
-                            target=_sb_update_shift,
-                            args=(row["id"], "night"),
-                            daemon=True
-                        ).start()
-                    print(f"[assign] ۲۰: {len(rows)} آلارم عصر → night (فردا ۸ صبح تقسیم)")
-                else:
-                    print("[assign] ۲۰: آلارم عصری برای انتقال نبود")
-
-        except Exception as e:
-            print(f"[assign] scheduler error: {e}")
-            time.sleep(300)
+    return (assignee, "")
 
 # ─── startup: بازسازی state از Supabase ─────────────────────────────
 
-def _check_missed_shifts_on_startup():
-    """
-    موقع startup چک کن کدوم شیفت‌های امروز miss شدن و اجرا کن.
-    اگه الان بین ۱۶-۲۰ هستیم و آلارم morning داریم → انتقال بده
-    اگه الان بعد از ۲۰ هستیم و آلارم morning/evening داریم → شب کن
-    اگه الان بعد از ۸ هستیم و آلارم night داریم → تقسیم کن
-    """
-    now_dt = datetime.now(TEHRAN)
-    weekday = now_dt.weekday()
-    h = now_dt.hour
-
-    if weekday in (5, 6):  # شنبه/یکشنبه
-        return
-
-    print(f"[assign] startup: چک missed shifts — ساعت {h}:00")
-
-    # ساعت ۸ تا ۱۶ — چک کن آلارم‌های شب تقسیم شدن
-    if 8 <= h < 16:
-        rows = _sb_load_pending_shifts(["night", "evening_handover", "weekend_pending"])
-        if rows:
-            print(f"[assign] startup: {len(rows)} آلارم شب تقسیم نشده — انجام میشه")
-            threading.Thread(
-                target=_send_handover_replies,
-                args=(rows, SHIFT_MORNING["members"], "تقسیم آلارم شب (جبران)"),
-                daemon=True).start()
-            with _startup_handover_lock:
-                _startup_handover_done["8am"] = True
-
-    # ساعت ۱۶ تا ۲۰ — چک کن صبح‌ها انتقال پیدا کردن
-    elif 16 <= h < 20:
-        rows = _sb_load_pending_shifts(["morning", "morning_handover"])
-        if rows:
-            print(f"[assign] startup: {len(rows)} آلارم صبح انتقال نشده — انجام میشه")
-            threading.Thread(
-                target=_send_handover_replies,
-                args=(rows, SHIFT_EVENING["members"], "انتقال از شیفت صبح (جبران)"),
-                daemon=True).start()
-            with _startup_handover_lock:
-                _startup_handover_done["16"] = True
-
-    # بعد از ۲۰ — چک کن عصری‌ها به night رفتن
-    elif h >= 20:
-        rows_ev = _sb_load_pending_shifts(["morning", "evening", "evening_handover"])
-        if rows_ev:
-            print(f"[assign] startup: {len(rows_ev)} آلارم عصر→شب نرفته — انجام میشه")
-            for row in rows_ev:
-                threading.Thread(
-                    target=_sb_update_shift,
-                    args=(row["id"], "night"),
-                    daemon=True).start()
-            print(f"[assign] {len(rows_ev)} آلارم → night")
-            with _startup_handover_lock:
-                _startup_handover_done["20"] = True
-
 def _sb_restore_on_startup():
     """
-    بعد از هر restart همه چیز رو از Supabase بازسازی کن.
-    هیچ چیزی از حافظه از دست نمیره.
+    بعد از هر restart، شمارش آلارم‌های فعال هر عضو رو از Supabase بازسازی کن
+    تا تقسیم رندومِ عادلانه بدون از دست دادن state ادامه پیدا کنه.
+    دیگه هیچ شیفت/handover/scheduler‌ای وجود نداره.
     """
     rows = _sb_load_active_assignments()
     _rebuild_active_assign_count(rows)
     print(f"[assign] startup: {len(rows)} آلارم active از Supabase بازسازی شد")
-    # جبران شیفت‌های miss شده
-    _check_missed_shifts_on_startup()
 
 
 
@@ -1988,6 +1758,62 @@ def _do_update(upd, token):
                             edit_tg_keyboard(token_cbq, cbq_cid, cbq_msg_id,
                                 f"🕯 تایم‌فریم هشدار برای <b>{r_sym}</b>:", kb_tf)
 
+                    elif cbq_data.startswith("ack_trigger:"):
+                        # ack_trigger:alarm_id:expected_user_id — فقط مسئول تریگر می‌تونه بزنه
+                        parts_ack = cbq_data.split(":", 2)
+                        ack_aid = parts_ack[1] if len(parts_ack) > 1 else ""
+                        ack_expected_id = parts_ack[2] if len(parts_ack) > 2 else ""
+                        clicker_id = str(cbq.get("from", {}).get("id", ""))
+                        if not ack_expected_id or clicker_id != ack_expected_id:
+                            answer_callback(token_cbq, cbq_id, "⛔ این دکمه فقط برای مسئول تریگره")
+                        else:
+                            answer_callback(token_cbq, cbq_id, "✅ ثبت شد")
+                            ack_name = TEAM_ID_TO_NAME.get(clicker_id, "")
+                            ack_time_label = now_pretty()
+
+                            def _do_ack(aid=ack_aid, name=ack_name, tlabel=ack_time_label):
+                                # ذخیره در Supabase — بدون دست زدن به بقیه فیلدها
+                                if SUPABASE_KEY:
+                                    try:
+                                        requests.patch(
+                                            f"{SUPABASE_URL}/rest/v1/alarm_assignments?id=eq.{aid}",
+                                            headers={**_sb_h(), "Prefer": "return=minimal"},
+                                            json={"ack_at": now_teh(), "ack_by": name},
+                                            timeout=8)
+                                    except Exception as e:
+                                        print(f"[ack] save exc: {e}")
+                                # ادیت پیام برای همه‌ی چت‌هایی که این آلارم توشون ارسال شده
+                                tok_ack, _, _ = _get_token_and_cids()
+                                msg_map_ack = _fired_msg_ids.get(aid, {})
+                                base_text = msg_map_ack.get("__text__", "")
+                                if not base_text:
+                                    return
+                                ack_line = f"\n✅ <b>{name}</b> قبول کرد در ساعت {tlabel}"
+                                new_text = base_text + ack_line
+                                # هر آلارم یه نماد ثابت داره — از تگ متن استخراج می‌کنیم نه از هر پیام
+                                sym_ack = _extract_symbol_from_tag(msg_map_ack.get("__tag__", ""))
+                                for tc_ack, tm_ack in msg_map_ack.items():
+                                    if tc_ack in ("__tag__", "__text__"):
+                                        continue
+                                    new_kb = {"inline_keyboard": [[
+                                        {"text": "⏰ هشدار دوره‌ای", "callback_data": f"set_reminder:{tc_ack}:{sym_ack}"}
+                                    ]]}
+                                    try:
+                                        requests.post(
+                                            f"https://api.telegram.org/bot{tok_ack}/editMessageText",
+                                            json={"chat_id": tc_ack, "message_id": tm_ack,
+                                                  "text": new_text, "parse_mode": "HTML",
+                                                  "reply_markup": new_kb},
+                                            timeout=8, headers=H)
+                                    except Exception as e:
+                                        print(f"[ack] edit exc: {e}")
+                                # آپدیت متن ذخیره‌شده تا اگه دوباره چیزی edit بشه این تغییر از دست نره
+                                msg_map_ack["__text__"] = new_text
+                                _fired_msg_ids[aid] = msg_map_ack
+                                threading.Thread(target=_sb_save_fired_msgs, args=(aid, msg_map_ack), daemon=True).start()
+
+                            threading.Thread(target=_do_ack, daemon=True).start()
+
                     elif cbq_data.startswith("set_reminder:"):
                         # set_reminder:cid:SYM — از دکمه کنار الارم
                         parts = cbq_data.split(":", 2)
@@ -2447,25 +2273,19 @@ def _do_update(upd, token):
                                 [{"text": "✉️ پیام به گروه",     "callback_data": "admin:broadcast"}],
                                 [{"text": "👥 لیست کاربران",      "callback_data": "admin:users"}],
                                 [{"text": "🗑 مدیریت سیگنال‌ها", "callback_data": "admin_sig:list:1"}],
-                                [{"text": "📋 تعیین شیفت",        "callback_data": "admin:shift:1"}],
+                                [{"text": "📋 مسئولین آلارم",        "callback_data": "admin:shift:1"}],
                                 [{"text": "✕ بستن",               "callback_data": "close_myalerts"}],
                             ]
                             edit_tg_keyboard(token_cbq, cbq_cid, cbq_msg_id,
                                 "⚙️ <b>پنل ادمین</b>\n\nیه گزینه انتخاب کن:", admin_kb_b)
 
-                    # ─── مدیریت شیفت (تعیین/جابجایی مسئول آلارم) ──────────────────
+                    # ─── مدیریت مسئولین آلارم (جابجایی دستی) ──────────────────
                     elif cbq_data.startswith("admin:shift"):
                         if cbq_cid != YOUR_CHAT_ID:
                             answer_callback(token_cbq, cbq_id, "⛔ فقط ادمین")
                         else:
                             parts_sh = cbq_data.split(":")
                             sh_action = parts_sh[2] if len(parts_sh) > 2 else "1"
-
-                            def _admin_shift_back_kb():
-                                return [
-                                    [{"text": "📋 تعیین شیفت", "callback_data": "admin:shift:1"}],
-                                    [{"text": "↩️ پنل ادمین",  "callback_data": "admin_sig:back"}],
-                                ]
 
                             # ── لیست آلارم‌های فعال (صفحه‌بندی ۵تایی) ──
                             if sh_action.isdigit():
@@ -2476,7 +2296,7 @@ def _do_update(upd, token):
                                 total_sh = len(sh_rows)
                                 if total_sh == 0:
                                     edit_tg_keyboard(token_cbq, cbq_cid, cbq_msg_id,
-                                        "📭 <b>هیچ آلارم فعالی برای تعیین شیفت نیست.</b>",
+                                        "📭 <b>هیچ آلارم فعالی نیست.</b>",
                                         [[{"text": "↩️ پنل ادمین", "callback_data": "admin_sig:back"}]])
                                 else:
                                     start_sh = (sh_page - 1) * PER_PAGE_SH
@@ -2487,10 +2307,9 @@ def _do_update(upd, token):
                                         tag_sh   = row_sh.get("alarm_tag", "")
                                         asn_sh   = row_sh.get("assigned_to") or "—"
                                         sym_sh   = row_sh.get("symbol", "")
-                                        shift_sh = row_sh.get("shift", "")
                                         lines_sh.append(
                                             f"• {tag_sh}  <code>{sym_sh}</code>\n"
-                                            f"  👤 {asn_sh}  |  🕐 {shift_sh}"
+                                            f"  👤 {asn_sh}"
                                         )
                                         aid_sh = row_sh.get("id","")
                                         kb_sh.append([{"text": f"🔀 {tag_sh} ({asn_sh})",
@@ -2503,48 +2322,17 @@ def _do_update(upd, token):
                                         nav_sh.append({"text": "بعد ▶️", "callback_data": f"admin:shift:{sh_page+1}"})
                                     if nav_sh:
                                         kb_sh.append(nav_sh)
-                                    kb_sh.append([{"text": "🔄 اجرای دستی تقسیم الان",
-                                                    "callback_data": "admin:shift:run_now"}])
                                     kb_sh.append([{"text": "↩️ پنل ادمین", "callback_data": "admin_sig:back"}])
                                     edit_tg_keyboard(token_cbq, cbq_cid, cbq_msg_id,
                                         "\n".join(lines_sh), kb_sh)
-
-                            # ── اجرای دستی تقسیم الان ──
-                            elif sh_action == "run_now":
-                                answer_callback(token_cbq, cbq_id, "⏳ در حال تقسیم...")
-                                def _do_run_now(tok=token_cbq, c=cbq_cid, mid=cbq_msg_id):
-                                    sh_now = _get_current_shift()
-                                    if sh_now == "morning":
-                                        rows_n = _sb_load_pending_shifts(["night","evening_handover","weekend_pending","evening"])
-                                        members_n = SHIFT_MORNING["members"]
-                                        label_n = "تقسیم دستی — شیفت صبح"
-                                    elif sh_now == "evening":
-                                        rows_n = _sb_load_pending_shifts(["morning","morning_handover"])
-                                        members_n = SHIFT_EVENING["members"]
-                                        label_n = "تقسیم دستی — شیفت عصر"
-                                    else:
-                                        rows_n = []
-                                        members_n = []
-                                        label_n = "شب/آخر هفته"
-                                    if rows_n and members_n:
-                                        _send_handover_replies(rows_n, members_n, label_n)
-                                        result_txt = f"✅ <b>{len(rows_n)} آلارم تقسیم شد</b>\nشیفت: {sh_now}"
-                                    else:
-                                        result_txt = f"⚠️ آلارم باز برای تقسیم نبود\nشیفت فعلی: {sh_now}"
-                                    edit_tg_keyboard(tok, c, mid, result_txt,
-                                        [[{"text": "📋 برگشت به لیست", "callback_data": "admin:shift:1"}],
-                                         [{"text": "↩️ پنل ادمین",    "callback_data": "admin_sig:back"}]])
-                                threading.Thread(target=_do_run_now, daemon=True).start()
 
                             # ── انتخاب آلارم برای reassign — نشون دادن لیست اعضا ──
                             elif sh_action == "assign" and len(parts_sh) >= 5:
                                 answer_callback(token_cbq, cbq_id)
                                 aid_asgn  = parts_sh[3]
                                 page_asgn = parts_sh[4]
-                                # همه اعضا برای انتخاب
-                                all_members = SHIFT_MORNING["members"] + SHIFT_EVENING["members"]
                                 kb_asgn = []
-                                for m in all_members:
+                                for m in TEAM_MEMBERS:
                                     kb_asgn.append([{"text": f"👤 {m}",
                                                       "callback_data": f"admin:shift:do:{aid_asgn}:{m}:{page_asgn}"}])
                                 kb_asgn.append([{"text": "↩️ برگشت به لیست",
@@ -2571,16 +2359,16 @@ def _do_update(upd, token):
                                         row_d = {}
                                     old_asn = row_d.get("assigned_to","")
                                     tag_d   = row_d.get("alarm_tag","")
+                                    already_acked = bool(row_d.get("ack_at"))
                                     # آپدیت شمارش حافظه
                                     if old_asn and old_asn in _active_assign_count:
                                         _active_assign_count[old_asn] = max(0, _active_assign_count[old_asn] - 1)
                                     _active_assign_count[asn] = _active_assign_count.get(asn, 0) + 1
                                     # ذخیره در Supabase
-                                    sh_cur = _get_current_shift() or row_d.get("shift","morning")
                                     requests.patch(
                                         f"{SUPABASE_URL}/rest/v1/alarm_assignments?id=eq.{aid}",
                                         headers={**_sb_h(), "Prefer": "return=minimal"},
-                                        json={"assigned_to": asn, "shift": sh_cur},
+                                        json={"assigned_to": asn},
                                         timeout=8)
                                     # ارسال reply به گروه
                                     tg_tok, cids_d, _ = _get_token_and_cids()
@@ -2599,6 +2387,23 @@ def _do_update(upd, token):
                                                       "reply_to_message_id": tm_d},
                                                 timeout=8, headers=H)
                                         except: pass
+                                    # آپدیت دکمه «دیدم» روی پیام اصلی هر گیرنده —
+                                    # فقط اگه هنوز کسی ack نکرده باشه، منتقلش کن به مسئول جدید
+                                    if not already_acked:
+                                        new_ack_id = TEAM_MEMBER_IDS.get(asn, "")
+                                        sym_d = _extract_symbol_from_tag(tag_d)
+                                        for tc_d, tm_d in msg_map_d.items():
+                                            if tc_d in ("__tag__","__text__"): continue
+                                            kb_d = [[{"text": "⏰ هشدار دوره‌ای", "callback_data": f"set_reminder:{tc_d}:{sym_d}"}]]
+                                            if new_ack_id and str(tc_d) == str(new_ack_id):
+                                                kb_d.append([{"text": "✅ دیدم", "callback_data": f"ack_trigger:{aid}:{new_ack_id}"}])
+                                            try:
+                                                requests.post(
+                                                    f"https://api.telegram.org/bot{tg_tok}/editMessageReplyMarkup",
+                                                    json={"chat_id": tc_d, "message_id": tm_d,
+                                                          "reply_markup": {"inline_keyboard": kb_d}},
+                                                    timeout=8, headers=H)
+                                            except: pass
                                     edit_tg_keyboard(tok, c, mid,
                                         f"✅ <b>جابجایی انجام شد</b>\n\n{tag_d}\n👤 {asn}",
                                         [[{"text": "📋 برگشت به لیست", "callback_data": f"admin:shift:{pg}"}],
@@ -2936,7 +2741,7 @@ def _do_update(upd, token):
                                     lines_tl.append(f"   • {tag_tl}")
                                 lines_tl.append("")
                             if unassigned:
-                                lines_tl.append("⏳ <b>منتظر تقسیم (شب/آخر هفته)</b>")
+                                lines_tl.append("⏳ <b>بدون مسئول</b>")
                                 for tag_tl, sh_tl in unassigned:
                                     lines_tl.append(f"   • {tag_tl}")
                             full_tl = "\n".join(lines_tl)
@@ -3105,9 +2910,7 @@ def _do_update(upd, token):
                     elif cbq_data.startswith("resend_active:"):
                         answer_callback(token_cbq, cbq_id, "⏳ در حال ارسال...")
                         ra_cid = cbq_data.split(":", 1)[1]
-                        rows_ra = _sb_load_pending_shifts(
-                            ["morning", "evening", "night", "morning_handover",
-                             "evening_handover", "weekend_pending"])
+                        rows_ra = _sb_load_active_assignments()
                         # فقط تیمی
                         all_alerts_ra = load_alerts().get("alarms", [])
                         private_ids_ra = {str(a["id"]) for a in all_alerts_ra if a.get("is_private")}
@@ -3923,7 +3726,7 @@ def _do_update(upd, token):
                         [{"text": "✉️ پیام به گروه",      "callback_data": "admin:broadcast"}],
                         [{"text": "👥 لیست کاربران",       "callback_data": "admin:users"}],
                         [{"text": "🗑 مدیریت سیگنال‌ها",  "callback_data": "admin_sig:list:1"}],
-                        [{"text": "📋 تعیین شیفت",         "callback_data": "admin:shift:1"}],
+                        [{"text": "📋 مسئولین آلارم",         "callback_data": "admin:shift:1"}],
                         [{"text": "✕ بستن",                "callback_data": "close_myalerts"}],
                     ]
                     send_tg_keyboard(token, cid,
@@ -4600,7 +4403,7 @@ def check_alerts():
                         dist = calc_dist_str(sym, atype, cur, tgt)
                         private_label = "\n\n🔒 <i>آلارم شخصی — فقط برای شما ارسال شده</i>" if a.get("is_private") else ""
                         creator_tag = "#" + re.sub(r'[^\w]', '_', creator).strip('_')
-                        # ── تعیین مسئول تریگر — فقط برای آلارم‌های تیمی، آلارم شخصی وارد تقسیم شیفت نمی‌شه ──
+                        # ── تعیین مسئول تریگر — فقط برای آلارم‌های تیمی، آلارم شخصی وارد تقسیم نمی‌شه ──
                         if a.get("is_private"):
                             _assignee, _shift = "", None
                             assignee_line = ""
@@ -4625,16 +4428,23 @@ def check_alerts():
                             f"{assignee_line}\n\n⏰ {now_pretty()} (تهران){created_label}"
                         )
                         # دکمه هشدار دوره‌ای برای همه — چه شخصی چه عمومی
-                        reminder_kb = lambda cid: [[{"text": "⏰ هشدار دوره‌ای", "callback_data": f"set_reminder:{cid}:{sym}"}]]
+                        # + دکمه «دیدم» فقط تو PV خودِ مسئول تریگر نمایش داده می‌شه
+                        # (هر chat_id همون PV شخصی هر کاربره، پس بقیه اصلاً دکمه رو نمی‌بینن)
+                        assignee_ack_id = TEAM_MEMBER_IDS.get(_assignee, "") if _assignee else ""
+                        def _fired_kb(cid):
+                            rows_kb = [[{"text": "⏰ هشدار دوره‌ای", "callback_data": f"set_reminder:{cid}:{sym}"}]]
+                            if assignee_ack_id and str(cid) == str(assignee_ack_id):
+                                rows_kb.append([{"text": "✅ دیدم", "callback_data": f"ack_trigger:{a['id']}:{assignee_ack_id}"}])
+                            return rows_kb
                         fired_cid_to_mid = {}
                         if a.get("is_private") and a.get("notify_only"):
                             priv_cid = str(a["notify_only"])
-                            mid_f = send_tg_keyboard(token, priv_cid, fired_msg, reminder_kb(priv_cid), track=False)
+                            mid_f = send_tg_keyboard(token, priv_cid, fired_msg, _fired_kb(priv_cid), track=False)
                             if mid_f:
                                 fired_cid_to_mid[priv_cid] = mid_f
                         else:
                             for cid in notify_cids:
-                                mid_f = send_tg_keyboard(token, str(cid), fired_msg, reminder_kb(str(cid)), track=False)
+                                mid_f = send_tg_keyboard(token, str(cid), fired_msg, _fired_kb(str(cid)), track=False)
                                 if mid_f:
                                     fired_cid_to_mid[str(cid)] = mid_f
                         # ذخیره map چت→پیام برای /del
@@ -7463,8 +7273,6 @@ threading.Thread(target=poll_telegram, daemon=True).start()
 print("[STARTUP] thread poll_telegram شروع شد")
 threading.Thread(target=poll_open_trades, daemon=True).start()
 print("[STARTUP] thread poll_open_trades شروع شد")
-threading.Thread(target=_assignment_scheduler, daemon=True).start()
-print("[STARTUP] thread assignment_scheduler شروع شد")
 
 # ── بازیابی fired_msgs و counters از Supabase بعد از restart ──
 _sb_load_fired_msgs()
