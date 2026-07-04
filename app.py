@@ -1576,6 +1576,7 @@ def daily_news_scheduler():
 _pending_name  = {}  # cid → True
 _pending_alarm = {}  # cid → {"step": str, "data": dict}
 _pending_reminder = {}  # cid → {step, bot_msg_id}
+_pending_bulk_false = {}  # cid → {"bot_msg_id": ..., "count": ...} — منتظر متن دلیل فالس‌کردن دسته‌جمعی
 _pending_weekly_search = {}  # cid → {"which": str, "msg_id": int}
 # آلارم_آیدی → {chat_id: message_id آخرین پیام False/آپدیت}
 _false_broadcast_ids: dict = {}
@@ -2360,6 +2361,7 @@ def _do_update(upd, token):
                                 [{"text": "👥 لیست کاربران",      "callback_data": "admin:users"}],
                                 [{"text": "🗑 مدیریت سیگنال‌ها", "callback_data": "admin_sig:list:1"}],
                                 [{"text": "📋 مسئولین آلارم",        "callback_data": "admin:shift:1"}],
+                                [{"text": "❌ فالس همه آلارم‌های فعال", "callback_data": "admin:bulkfalse:0"}],
                                 [{"text": "✕ بستن",               "callback_data": "close_myalerts"}],
                             ]
                             edit_tg_keyboard(token_cbq, cbq_cid, cbq_msg_id,
@@ -2495,6 +2497,86 @@ def _do_update(upd, token):
                                         [[{"text": "📋 برگشت به لیست", "callback_data": f"admin:shift:{pg}"}],
                                          [{"text": "↩️ پنل ادمین",    "callback_data": "admin_sig:back"}]])
                                 threading.Thread(target=_do_reassign, daemon=True).start()
+
+                    # ─── فالس دسته‌جمعی همه‌ی آلارم‌های فعال ──────────────────
+                    elif cbq_data.startswith("admin:bulkfalse"):
+                        if cbq_cid != YOUR_CHAT_ID:
+                            answer_callback(token_cbq, cbq_id, "⛔ فقط ادمین")
+                        else:
+                            bf_parts = cbq_data.split(":")
+                            bf_step = bf_parts[2] if len(bf_parts) > 2 else "0"
+
+                            # مرحله ۰: نمایش تعداد و درخواست تایید
+                            if bf_step == "0":
+                                answer_callback(token_cbq, cbq_id, "⏳ شمارش...")
+                                bf_rows = _sb_load_active_assignments()
+                                bf_count = len(bf_rows)
+                                if bf_count == 0:
+                                    edit_tg_keyboard(token_cbq, cbq_cid, cbq_msg_id,
+                                        "📭 <b>هیچ آلارم فعالی نیست.</b>",
+                                        [[{"text": "↩️ پنل ادمین", "callback_data": "admin_sig:back"}]])
+                                else:
+                                    lines_bf = [f"⚠️ <b>فالس دسته‌جمعی</b>\n\n{bf_count} آلارم فعال پیدا شد:\n"]
+                                    for row_bf in bf_rows[:20]:
+                                        lines_bf.append(f"• {row_bf.get('alarm_tag','')}  👤 {row_bf.get('assigned_to','—')}")
+                                    if bf_count > 20:
+                                        lines_bf.append(f"... و {bf_count-20} مورد دیگه")
+                                    lines_bf.append(f"\nهمه‌ی این {bf_count} آلارم false می‌شن. مطمئنی؟")
+                                    edit_tg_keyboard(token_cbq, cbq_cid, cbq_msg_id,
+                                        "\n".join(lines_bf),
+                                        [[{"text": f"✅ بله، همه رو false کن ({bf_count})", "callback_data": "admin:bulkfalse:reason"}],
+                                         [{"text": "↩️ انصراف", "callback_data": "admin_sig:back"}]])
+
+                            # مرحله ۱: درخواست متن دلیل
+                            elif bf_step == "reason":
+                                answer_callback(token_cbq, cbq_id)
+                                bf_rows2 = _sb_load_active_assignments()
+                                _pending_bulk_false[cbq_cid] = {"bot_msg_id": cbq_msg_id, "count": len(bf_rows2)}
+                                edit_tg_keyboard(token_cbq, cbq_cid, cbq_msg_id,
+                                    f"📝 <b>دلیل فالس کردن {len(bf_rows2)} آلارم رو بنویس</b>\n\n"
+                                    f"(مثلاً: آخر هفته / تعطیلی / تست)\n\n"
+                                    f"یا دکمه‌ی زیر رو بزن تا بدون دلیل ثبت بشه.",
+                                    [[{"text": "⏭ بدون دلیل، فقط false کن", "callback_data": "admin:bulkfalse:go:__no_reason__"}],
+                                     [{"text": "❌ انصراف", "callback_data": "admin_sig:back"}]])
+
+                            # مرحله ۲: اجرای نهایی (یا از متن تایپ‌شده، یا از دکمه‌ی بدون دلیل)
+                            elif bf_step == "go":
+                                bf_reason = bf_parts[3] if len(bf_parts) > 3 else ""
+                                if bf_reason == "__no_reason__":
+                                    bf_reason = ""
+                                answer_callback(token_cbq, cbq_id, "⏳ در حال فالس کردن همه...")
+                                _pending_bulk_false.pop(cbq_cid, None)
+
+                                def _do_bulk_false(reason=bf_reason, tok=token_cbq, c=cbq_cid, mid=cbq_msg_id):
+                                    rows_bf = _sb_load_active_assignments()
+                                    admin_name_bf = _get_user_custom_name(c) or "ادمین"
+                                    done_count = 0
+                                    for row_bf in rows_bf:
+                                        aid_bf = row_bf.get("id")
+                                        tag_bf = row_bf.get("alarm_tag", "")
+                                        # همون تابع false تکی رو صدا بزن — یکسان با /False دستی
+                                        _sb_false_assignment(aid_bf, admin_name_bf, reason)
+                                        done_count += 1
+                                        # ریپلای به همه‌ی گیرنده‌های این آلارم
+                                        msg_map_bf = _fired_msg_ids.get(aid_bf, {})
+                                        reason_line_bf = f"\n📝 علت: {reason}" if reason else ""
+                                        reply_bf = (f"❌ <b>فالس (دسته‌جمعی توسط ادمین)</b>\n\n"
+                                                    f"{tag_bf}{reason_line_bf}")
+                                        for tc_bf, tm_bf in msg_map_bf.items():
+                                            if tc_bf in ("__tag__", "__text__"): continue
+                                            try:
+                                                requests.post(
+                                                    f"https://api.telegram.org/bot{tok}/sendMessage",
+                                                    json={"chat_id": tc_bf, "text": reply_bf,
+                                                          "parse_mode": "HTML", "reply_to_message_id": tm_bf},
+                                                    timeout=8, headers=H)
+                                            except: pass
+                                    # بعد از فالس کردن همه، شمارش عادلانه رو یک‌بار نهایی بازسازی کن
+                                    _rebuild_active_assign_count(_sb_load_active_assignments())
+                                    edit_tg_keyboard(tok, c, mid,
+                                        f"✅ <b>{done_count} آلارم false شدن</b>" + (f"\n📝 علت: {reason}" if reason else ""),
+                                        [[{"text": "↩️ پنل ادمین", "callback_data": "admin_sig:back"}]])
+                                threading.Thread(target=_do_bulk_false, daemon=True).start()
 
                     elif cbq_data.startswith("clean_chat:"):
                         answer_callback(token_cbq, cbq_id, "🧹 در حال پاک‌سازی...")
@@ -3814,6 +3896,7 @@ def _do_update(upd, token):
                         [{"text": "👥 لیست کاربران",       "callback_data": "admin:users"}],
                         [{"text": "🗑 مدیریت سیگنال‌ها",  "callback_data": "admin_sig:list:1"}],
                         [{"text": "📋 مسئولین آلارم",         "callback_data": "admin:shift:1"}],
+                        [{"text": "❌ فالس همه آلارم‌های فعال", "callback_data": "admin:bulkfalse:0"}],
                         [{"text": "✕ بستن",                "callback_data": "close_myalerts"}],
                     ]
                     send_tg_keyboard(token, cid,
@@ -3851,6 +3934,40 @@ def _do_update(upd, token):
                         "⚡ <b>آلارم فوری</b>\n\nاسم نماد رو بنویس:\n<code>EURUSD</code>  <code>XAUUSD</code>  <code>BTC</code>",
                         kb_sos)
                     _pending_alarm[cid] = {"step": "sos_symbol", "data": {}, "bot_msg_id": mid_sos}
+
+                elif cid in _pending_bulk_false and not txt.startswith("/") and cid == YOUR_CHAT_ID:
+                    bf_info = _pending_bulk_false.pop(cid)
+                    bf_mid = bf_info.get("bot_msg_id")
+                    bf_reason_txt = txt.strip()
+                    send_tg(token, cid, f"⏳ در حال false کردن {bf_info.get('count',0)} آلارم...")
+
+                    def _do_bulk_false_txt(reason=bf_reason_txt, tok=token, c=cid, mid=bf_mid):
+                        rows_bft = _sb_load_active_assignments()
+                        admin_name_bft = _get_user_custom_name(c) or "ادمین"
+                        done_count_t = 0
+                        for row_bft in rows_bft:
+                            aid_bft = row_bft.get("id")
+                            tag_bft = row_bft.get("alarm_tag", "")
+                            _sb_false_assignment(aid_bft, admin_name_bft, reason)
+                            done_count_t += 1
+                            msg_map_bft = _fired_msg_ids.get(aid_bft, {})
+                            reason_line_bft = f"\n📝 علت: {reason}" if reason else ""
+                            reply_bft = (f"❌ <b>فالس (دسته‌جمعی توسط ادمین)</b>\n\n"
+                                         f"{tag_bft}{reason_line_bft}")
+                            for tc_bft, tm_bft in msg_map_bft.items():
+                                if tc_bft in ("__tag__", "__text__"): continue
+                                try:
+                                    requests.post(
+                                        f"https://api.telegram.org/bot{tok}/sendMessage",
+                                        json={"chat_id": tc_bft, "text": reply_bft,
+                                              "parse_mode": "HTML", "reply_to_message_id": tm_bft},
+                                        timeout=8, headers=H)
+                                except: pass
+                        _rebuild_active_assign_count(_sb_load_active_assignments())
+                        edit_tg_keyboard(tok, c, mid,
+                            f"✅ <b>{done_count_t} آلارم false شدن</b>\n📝 علت: {reason}",
+                            [[{"text": "↩️ پنل ادمین", "callback_data": "admin_sig:back"}]])
+                    threading.Thread(target=_do_bulk_false_txt, daemon=True).start()
 
                 elif cid in _pending_reminder and not txt.startswith("/"):
                     pr_step = _pending_reminder[cid].get("step")
