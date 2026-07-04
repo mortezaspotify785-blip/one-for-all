@@ -21,6 +21,9 @@ BROADCAST_MODE = os.environ.get("BROADCAST_MODE", "false").lower() == "true"
 
 _cache_alerts = None
 _cache_journal = None
+# قفل محافظ کش آلارم‌ها — جلوگیری از race condition وقتی چند thread هم‌زمان
+# (مثلاً check_alerts و add_alert) با فاصله‌ی کم روی _cache_alerts کار می‌کنن
+_alerts_cache_lock = threading.RLock()
 
 def now_teh():
     return datetime.now(TEHRAN).strftime("%Y-%m-%d %H:%M:%S")
@@ -204,22 +207,23 @@ def _sb_load_all_alerts():
 
 def load_alerts():
     global _cache_alerts
-    if _cache_alerts is not None:
+    with _alerts_cache_lock:
+        if _cache_alerts is not None:
+            return _cache_alerts
+        # 1. Supabase
+        d = _sb_load_all_alerts()
+        if d is not None:
+            _cache_alerts = d
+            return _cache_alerts
+        # 2. local fallback
+        if os.path.exists(ALERTS_FILE):
+            try:
+                with open(ALERTS_FILE, "r", encoding="utf-8") as f:
+                    _cache_alerts = fix_alerts(json.load(f))
+                    return _cache_alerts
+            except: pass
+        _cache_alerts = _empty_alerts()
         return _cache_alerts
-    # 1. Supabase
-    d = _sb_load_all_alerts()
-    if d is not None:
-        _cache_alerts = d
-        return _cache_alerts
-    # 2. local fallback
-    if os.path.exists(ALERTS_FILE):
-        try:
-            with open(ALERTS_FILE, "r", encoding="utf-8") as f:
-                _cache_alerts = fix_alerts(json.load(f))
-                return _cache_alerts
-        except: pass
-    _cache_alerts = _empty_alerts()
-    return _cache_alerts
 
 def _sb_delete_alert(aid):
     """یه آلارم رو از Supabase حذف کن"""
@@ -237,7 +241,8 @@ def _sb_delete_alert(aid):
 def save_alerts(data):
     """cache رو آپدیت کن + local backup — Supabase رو در background بزن"""
     global _cache_alerts
-    _cache_alerts = data
+    with _alerts_cache_lock:
+        _cache_alerts = data
     # local backup سریع
     try:
         with open(ALERTS_FILE, "w", encoding="utf-8") as f:
@@ -4404,8 +4409,9 @@ def check_alerts():
         try:
             _loop_count += 1
             global _cache_alerts
-            _cache_alerts = None
-            token, cids, data = _get_token_and_cids()
+            with _alerts_cache_lock:
+                _cache_alerts = None
+                token, cids, data = _get_token_and_cids()
             _fired_backup_ids = _load_fired_backup_ids()
             active = [a for a in data.get("alerts", [])
                       if a.get("active") and str(a["id"]) not in _deleted_ids
@@ -4929,7 +4935,6 @@ def get_my_alerts():
 
 @app.route("/api/alerts", methods=["POST"])
 def add_alert():
-    data = load_alerts()
     body = request.json or {}
     sym = body.get("symbol","").upper().strip()
     atype = body.get("type","forex")
@@ -4945,8 +4950,12 @@ def add_alert():
         "last_price": cur, "last_checked": now_teh() if cur else None,
         "created_at": now_teh()
     }
-    data["alerts"].append(a)
-    save_alerts(data)
+    # قفل: خوندن، اضافه‌کردن، و ذخیره باید یه عملیات atomic باشه —
+    # وگرنه اگه check_alerts هم‌زمان کش رو رفرش کنه، یکی از تغییرات گم می‌شه
+    with _alerts_cache_lock:
+        data = load_alerts()
+        data["alerts"].append(a)
+        save_alerts(data)
     return jsonify({"ok": True, "alert": a})
 
 @app.route("/api/alerts/<aid>", methods=["DELETE"])
