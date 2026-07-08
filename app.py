@@ -1,4 +1,4 @@
-import os, json, time, threading, requests, pytz
+import os, json, time, threading, requests, pytz, secrets
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from flask import Flask, request, jsonify, send_from_directory
 from datetime import datetime, timedelta
@@ -141,6 +141,34 @@ def _sb_upsert_config(tg, users, errors):
             print(f"[alerts] config save: {r.status_code} {r.text[:80]}")
     except Exception as e:
         print(f"[alerts] config save error: {e}")
+
+def _sb_load_deprioritize_masoud() -> bool:
+    """می‌خونه آیا اولویت پایین مسعود فعاله یا نه — پیش‌فرض True اگه چیزی پیدا نشد"""
+    if not SUPABASE_KEY:
+        return True
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/alerts?id=eq.__config__&select=deprioritize_masoud",
+            headers=_sb_h(), timeout=8)
+        if r.status_code == 200:
+            rows = r.json()
+            if rows and rows[0].get("deprioritize_masoud") is not None:
+                return bool(rows[0]["deprioritize_masoud"])
+    except Exception as e:
+        print(f"[assign] load deprioritize_masoud exc: {e}")
+    return True
+
+def _sb_save_deprioritize_masoud(value: bool):
+    """فقط همین یک فیلد رو patch می‌کنه — با upsert_config تداخل نداره"""
+    if not SUPABASE_KEY:
+        return
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/alerts?id=eq.__config__",
+            headers={**_sb_h(), "Prefer": "return=minimal"},
+            json={"deprioritize_masoud": value}, timeout=8)
+    except Exception as e:
+        print(f"[assign] save deprioritize_masoud exc: {e}")
 
 def _sb_load_all_alerts():
     """همه ردیف‌های جدول alerts رو بخون و به فرمت داخلی تبدیل کن"""
@@ -719,11 +747,62 @@ TEAM_MEMBER_IDS = {
 # معکوس: آیدی → اسم (برای چک سریع از from.id در callback)
 TEAM_ID_TO_NAME = {v: k for k, v in TEAM_MEMBER_IDS.items()}
 
-# نام‌هایی که باید در تقسیم عادلانه «ترجیح داده نشن» مگه مجبور باشیم
+# نام کسی که در حالت فعال «ترجیح داده نمی‌شه» — این خودش همیشه ثابت می‌مونه،
+# اما این‌که فعال باشه یا نه از پنل وب قابل تغییره (نگاه کن به _deprioritize_masoud_active)
 DEPRIORITIZED_MEMBER = "مسعود"
 # بازه ساعتی تهران که این عضو تقریباً هیچ‌وقت نباید بگیره مگه بقیه مشغول باشن
 DEPRIORITIZED_BLOCK_START = 8
 DEPRIORITIZED_BLOCK_END = 12
+
+# آیا اولویت پایین مسعود فعاله؟ در startup از Supabase لود می‌شه و از پنل وب
+# قابل تغییره. پیش‌فرض True تا رفتار فعلی حفظ بشه.
+_deprioritize_masoud_active: bool = True
+_deprioritize_masoud_lock = threading.Lock()
+
+def _get_deprioritize_masoud() -> bool:
+    with _deprioritize_masoud_lock:
+        return _deprioritize_masoud_active
+
+def _set_deprioritize_masoud(value: bool):
+    global _deprioritize_masoud_active
+    with _deprioritize_masoud_lock:
+        _deprioritize_masoud_active = value
+    _sb_save_deprioritize_masoud(value)
+
+# =====================================================================
+# 🌐 پنل ادمین وب — /admin-panel
+# =====================================================================
+ADMIN_PANEL_PASSWORD = os.environ.get("ADMIN_PANEL_PASSWORD", "")
+# session tokenهای معتبر — در حافظه، با انقضای ۱۲ ساعته
+_admin_sessions: dict = {}  # token → expiry_timestamp
+_admin_sessions_lock = threading.Lock()
+ADMIN_SESSION_TTL_SECONDS = 12 * 3600
+
+def _create_admin_session() -> str:
+    token = secrets.token_urlsafe(32)
+    with _admin_sessions_lock:
+        _admin_sessions[token] = time.time() + ADMIN_SESSION_TTL_SECONDS
+    return token
+
+def _validate_admin_session(token: str) -> bool:
+    if not token:
+        return False
+    with _admin_sessions_lock:
+        expiry = _admin_sessions.get(token)
+        if expiry is None:
+            return False
+        if time.time() > expiry:
+            del _admin_sessions[token]
+            return False
+        return True
+
+def _require_admin_session():
+    """چک هدر Authorization برای endpointهای پنل وب — برمی‌گردونه None اگه معتبر بود، وگرنه یه Flask response خطا"""
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.replace("Bearer ", "").strip()
+    if not _validate_admin_session(token):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return None
 
 def _is_weekend_tehran():
     """شنبه (5) و یکشنبه (6) — فقط برای نمایش/گزارش، دیگه تاثیری در تقسیم نداره"""
@@ -856,8 +935,12 @@ def _pick_assignee(members: list) -> str:
         return ""
     counts = {m: _active_assign_count.get(m, 0) for m in members}
 
+    # اگه اولویت پایین مسعود از پنل خاموش شده باشه، دیگه استثنا قائل نشو —
+    # دقیقاً مثل بقیه‌ی اعضا وارد چرخه‌ی عادلانه‌ی خالص می‌شه
+    deprioritize_on = _get_deprioritize_masoud()
+
     others = [m for m in members if m != DEPRIORITIZED_MEMBER]
-    has_deprioritized = DEPRIORITIZED_MEMBER in members
+    has_deprioritized = deprioritize_on and (DEPRIORITIZED_MEMBER in members)
 
     h_now = datetime.now(TEHRAN).hour
     in_block_hours = DEPRIORITIZED_BLOCK_START <= h_now < DEPRIORITIZED_BLOCK_END
@@ -927,9 +1010,13 @@ def _sb_restore_on_startup():
     تا تقسیم رندومِ عادلانه بدون از دست دادن state ادامه پیدا کنه.
     دیگه هیچ شیفت/handover/scheduler‌ای وجود نداره.
     """
+    global _deprioritize_masoud_active
     rows = _sb_load_active_assignments()
     _rebuild_active_assign_count(rows)
-    print(f"[assign] startup: {len(rows)} آلارم active از Supabase بازسازی شد")
+    with _deprioritize_masoud_lock:
+        _deprioritize_masoud_active = _sb_load_deprioritize_masoud()
+    print(f"[assign] startup: {len(rows)} آلارم active از Supabase بازسازی شد — "
+          f"اولویت پایین مسعود: {'فعال' if _deprioritize_masoud_active else 'غیرفعال'}")
 
 
 
@@ -5709,6 +5796,215 @@ def api_assignments():
         return jsonify({"ok": True, "count": len(result), "items": result})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+# =====================================================================
+# 🌐 پنل ادمین وب — API endpoints
+# =====================================================================
+
+@app.route("/admin-panel")
+def admin_panel_page():
+    """صفحه‌ی HTML پنل ادمین وب — لاگین + داشبورد"""
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "admin_panel.html")
+
+
+@app.route("/api/admin-panel/login", methods=["POST"])
+def admin_panel_login():
+    body = request.json or {}
+    pw = body.get("password", "")
+    if not ADMIN_PANEL_PASSWORD:
+        return jsonify({"ok": False, "error": "رمز پنل تنظیم نشده — باید ADMIN_PANEL_PASSWORD رو تو Railway بذاری"}), 500
+    if not secrets.compare_digest(pw, ADMIN_PANEL_PASSWORD):
+        return jsonify({"ok": False, "error": "رمز اشتباهه"}), 401
+    token = _create_admin_session()
+    return jsonify({"ok": True, "token": token})
+
+
+@app.route("/api/admin-panel/assignments", methods=["GET"])
+def admin_panel_assignments():
+    """لیست آلارم‌های فعال با مسئول‌هاشون — برای بخش «مسئولین آلارم» پنل وب"""
+    auth_err = _require_admin_session()
+    if auth_err:
+        return auth_err
+    rows = _sb_load_active_assignments()
+    raw = _sb_load_all_alerts()
+    if raw and isinstance(raw, dict):
+        all_alerts = raw.get("alarms", []) + raw.get("archive", [])
+    else:
+        fb = load_alerts()
+        all_alerts = fb.get("alarms", []) + fb.get("archive", [])
+    alerts_map = {str(a["id"]): a for a in all_alerts}
+
+    items = []
+    for row in rows:
+        aid = str(row.get("id", ""))
+        alert = alerts_map.get(aid, {})
+        if alert.get("is_private"):
+            continue
+        sym = alert.get("symbol", "")
+        tgt = alert.get("target_price", 0) or 0
+        items.append({
+            "id": aid,
+            "alarm_tag": row.get("alarm_tag", ""),
+            "assigned_to": row.get("assigned_to", "") or "",
+            "symbol": sym,
+            "condition": alert.get("condition", ""),
+            "target_fmt": fmt_price(float(tgt), sym) if tgt else "",
+            "fired_at": row.get("fired_at", ""),
+        })
+    return jsonify({"ok": True, "items": items, "team_members": TEAM_MEMBERS})
+
+
+@app.route("/api/admin-panel/reassign", methods=["POST"])
+def admin_panel_reassign():
+    """جابجایی دستی مسئول یک آلارم — همون منطق پنل تلگرام"""
+    auth_err = _require_admin_session()
+    if auth_err:
+        return auth_err
+    body = request.json or {}
+    aid = str(body.get("id", ""))
+    new_assignee = body.get("assignee", "")
+    if not aid or new_assignee not in TEAM_MEMBERS:
+        return jsonify({"ok": False, "error": "پارامتر نامعتبر"}), 400
+
+    try:
+        r_get = requests.get(
+            f"{SUPABASE_URL}/rest/v1/alarm_assignments?id=eq.{aid}&select=*",
+            headers=_sb_h(), timeout=8)
+        row = r_get.json()[0] if r_get.status_code == 200 and r_get.json() else {}
+    except Exception:
+        row = {}
+    old_assignee = row.get("assigned_to", "")
+    tag = row.get("alarm_tag", "")
+    already_acked = bool(row.get("ack_at"))
+
+    if old_assignee and old_assignee in _active_assign_count:
+        _active_assign_count[old_assignee] = max(0, _active_assign_count[old_assignee] - 1)
+    _active_assign_count[new_assignee] = _active_assign_count.get(new_assignee, 0) + 1
+
+    requests.patch(
+        f"{SUPABASE_URL}/rest/v1/alarm_assignments?id=eq.{aid}",
+        headers={**_sb_h(), "Prefer": "return=minimal"},
+        json={"assigned_to": new_assignee}, timeout=8)
+
+    # ریپلای به گروه — دقیقاً مثل جابجایی دستی تو تلگرام
+    tg_tok, _, _ = _get_token_and_cids()
+    msg_map = _fired_msg_ids.get(aid, {})
+    reply_text = (f"🔀 <b>جابجایی دستی (از پنل وب)</b>\n\n{tag}\n"
+                  f"👤 مسئول جدید: <b>{new_assignee}</b>"
+                  + (f"\n↩️ قبلی: {old_assignee}" if old_assignee else ""))
+    for tc, tm in msg_map.items():
+        if tc in ("__tag__", "__text__"):
+            continue
+        try:
+            requests.post(f"https://api.telegram.org/bot{tg_tok}/sendMessage",
+                          json={"chat_id": tc, "text": reply_text, "parse_mode": "HTML", "reply_to_message_id": tm},
+                          timeout=8, headers=H)
+        except Exception:
+            pass
+
+    # آپدیت دکمه‌ی «دیدم» — منتقلش کن به مسئول جدید (اگه هنوز کسی ack نکرده)
+    if not already_acked:
+        new_ack_id = TEAM_MEMBER_IDS.get(new_assignee, "")
+        sym_r = _extract_symbol_from_tag(tag)
+        for tc, tm in msg_map.items():
+            if tc in ("__tag__", "__text__"):
+                continue
+            kb = [[{"text": "⏰ هشدار دوره‌ای", "callback_data": f"set_reminder:{tc}:{sym_r}"}]]
+            if new_ack_id and str(tc) == str(new_ack_id):
+                kb.append([{"text": "✅ دیدم", "callback_data": f"ack_trigger:{aid}:{new_ack_id}"}])
+            try:
+                requests.post(f"https://api.telegram.org/bot{tg_tok}/editMessageReplyMarkup",
+                              json={"chat_id": tc, "message_id": tm, "reply_markup": {"inline_keyboard": kb}},
+                              timeout=8, headers=H)
+            except Exception:
+                pass
+
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin-panel/users", methods=["GET"])
+def admin_panel_users():
+    auth_err = _require_admin_session()
+    if auth_err:
+        return auth_err
+    data = load_alerts()
+    users = data.get("users", [])
+    return jsonify({"ok": True, "users": [
+        {"chat_id": str(u.get("chat_id", "")),
+         "name": u.get("custom_name", "") or u.get("username", "") or str(u.get("chat_id", "")),
+         "private_access": bool(u.get("private_access"))}
+        for u in users
+    ]})
+
+
+@app.route("/api/admin-panel/users/<chat_id>", methods=["DELETE"])
+def admin_panel_delete_user(chat_id):
+    """حذف کاربر — دقیقاً همون منطق admin:confirmdelete تو تلگرام"""
+    auth_err = _require_admin_session()
+    if auth_err:
+        return auth_err
+    with _alerts_cache_lock:
+        data = load_alerts()
+        data["users"] = [u for u in data.get("users", []) if str(u.get("chat_id", "")) != str(chat_id)]
+        data["telegram"]["chat_ids"] = [x for x in data["telegram"].get("chat_ids", []) if str(x) != str(chat_id)]
+        save_alerts(data)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/admin-panel/bulk-false", methods=["POST"])
+def admin_panel_bulk_false():
+    """فالس دسته‌جمعی همه‌ی آلارم‌های فعال — دقیقاً همون منطق admin:bulkfalse تو تلگرام"""
+    auth_err = _require_admin_session()
+    if auth_err:
+        return auth_err
+    body = request.json or {}
+    reason = (body.get("reason") or "").strip()
+
+    rows = _sb_load_active_assignments()
+    tg_tok, _, _ = _get_token_and_cids()
+    done_count = 0
+    for row in rows:
+        aid = row.get("id")
+        tag = row.get("alarm_tag", "")
+        _sb_false_assignment(aid, "ادمین (پنل وب)", reason)
+        done_count += 1
+        msg_map = _fired_msg_ids.get(aid, {})
+        reason_line = f"\n📝 علت: {reason}" if reason else ""
+        reply_text = f"❌ <b>فالس (دسته‌جمعی از پنل وب)</b>\n\n{tag}{reason_line}"
+        for tc, tm in msg_map.items():
+            if tc in ("__tag__", "__text__"):
+                continue
+            try:
+                requests.post(f"https://api.telegram.org/bot{tg_tok}/sendMessage",
+                              json={"chat_id": tc, "text": reply_text, "parse_mode": "HTML", "reply_to_message_id": tm},
+                              timeout=8, headers=H)
+            except Exception:
+                pass
+    _rebuild_active_assign_count(_sb_load_active_assignments())
+    return jsonify({"ok": True, "count": done_count})
+
+
+@app.route("/api/admin-panel/deprioritize-masoud", methods=["GET"])
+def admin_panel_get_deprioritize():
+    """وضعیت فعلی تاگل اولویت پایین مسعود رو برمی‌گردونه"""
+    auth_err = _require_admin_session()
+    if auth_err:
+        return auth_err
+    return jsonify({"ok": True, "active": _get_deprioritize_masoud()})
+
+
+@app.route("/api/admin-panel/deprioritize-masoud", methods=["POST"])
+def admin_panel_set_deprioritize():
+    """روشن/خاموش کردن اولویت پایین مسعود از پنل وب"""
+    auth_err = _require_admin_session()
+    if auth_err:
+        return auth_err
+    body = request.json or {}
+    value = bool(body.get("active", True))
+    _set_deprioritize_masoud(value)
+    return jsonify({"ok": True, "active": value})
+
+
 
     journal = load_journal()
     week_trades = []
