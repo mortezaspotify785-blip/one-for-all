@@ -208,6 +208,7 @@ select option{background:var(--bg3)}
 .dist-bar.far{background:linear-gradient(90deg,var(--green),var(--green2))}
 .dist-bar.close{background:linear-gradient(90deg,var(--red),#ff7a90)}
 .acard-footer{display:flex;align-items:center;justify-content:space-between;margin-top:12px;padding-top:8px;border-top:1px solid var(--border)}
+.acard-created{font-size:10.5px;color:var(--text2);margin-top:6px;font-family:var(--mono);opacity:.85}
 .acard-comment{font-size:13px;font-weight:600;color:var(--text);background:var(--bg4);padding:4px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:6px;max-width:70%;word-break:break-word}
 .acard-dir{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-family:var(--mono);font-weight:700;padding:4px 12px;border-radius:30px}
 .acard-dir.up{background:var(--gdim);color:var(--green)}
@@ -988,6 +989,14 @@ function getPipDistance(a) {
 }
 
 function minutesAgo(ts) { if (!ts) return null; const serverDate = new Date(ts.replace(' ', 'T') + '+03:30'); const diff = (Date.now() - serverDate) / 60000; if (diff < 0) return 'همین الان'; if (diff < 1) return 'همین الان'; if (diff < 60) return Math.round(diff) + ' دقیقه پیش'; return Math.round(diff/60) + ' ساعت پیش'; }
+function formatCreatedAt(ts) {
+  if (!ts) return null;
+  const d = new Date(ts.replace(' ', 'T') + '+03:30');
+  if (isNaN(d.getTime())) return null;
+  const datePart = d.toLocaleDateString('fa-IR', { timeZone: 'Asia/Tehran', year: 'numeric', month: '2-digit', day: '2-digit' });
+  const timePart = d.toLocaleTimeString('fa-IR', { timeZone: 'Asia/Tehran', hour: '2-digit', minute: '2-digit' });
+  return `${datePart} - ${timePart}`;
+}
 
 // ========== Card rendering ==========
 function buildCard(a) {
@@ -1004,6 +1013,7 @@ function buildCard(a) {
   const ivBadge = `<span class="iv-badge ${iv.cls}">${iv.label}</span>`;
   const agoHtml = ago ? `<span class="ago-lbl ${iv.cls}">${ago}</span>` : '';
   const staleHtml = a.price_stale ? `<div style="font-size:10px;color:var(--gold);margin-top:6px;padding:4px 10px;background:var(--gdold);border-radius:8px;">⏸ بازار تعطیل — آخرین قیمت ${a.price_stale.slice(11,16)}</div>` : '';
+  const createdHtml = formatCreatedAt(a.created_at) ? `<div class="acard-created">📅 ثبت: ${formatCreatedAt(a.created_at)}</div>` : '';
   const creatorName = a.created_by || 'ناشناس';
   const privateBadge = isPrivate ? `<div class="private-badge">🔒 آلارم شخصی</div>` : '';
   const badgeStyle = isPrivate ? 'background:var(--purdim);color:var(--purple);border-color:rgba(240,165,0,.3)' : '';
@@ -1034,6 +1044,7 @@ function buildCard(a) {
       ${cmtHtml}
       <span class="acard-dir ${isAbove?'dn':'up'}">${isAbove?'📉 ناحیه سل':'📈 ناحیه بای'}</span>
     </div>
+    ${createdHtml}
     ${staleHtml}
   </div>`;
 }
@@ -1070,6 +1081,7 @@ function buildListRow(a) {
       <span class="detail-item"><span class="detail-label">📏 فاصله:</span><span class="detail-value">${di.text}</span></span>
       <span class="detail-item"><span class="detail-label">⏱️ آخرین بررسی:</span><span class="detail-value">${ago || '—'}</span></span>
       <span class="detail-item"><span class="detail-label">🔄 بازه:</span><span class="detail-value">${iv.label}</span></span>
+      ${formatCreatedAt(a.created_at) ? `<span class="detail-item"><span class="detail-label">📅 ثبت:</span><span class="detail-value">${formatCreatedAt(a.created_at)}</span></span>` : ''}
       ${a.comment ? `<span class="detail-item"><span class="detail-label">📝 یادداشت:</span><span class="detail-value">${a.comment}</span></span>` : ''}
       ${a.price_stale ? `<span class="detail-item"><span class="detail-label">⚠️ وضعیت:</span><span class="detail-value">تعطیل (${a.price_stale.slice(11,16)})</span></span>` : ''}
     </div>
