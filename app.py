@@ -809,7 +809,53 @@ def _is_weekend_tehran():
     return datetime.now(TEHRAN).weekday() in (5, 6)
 
 # { member_name: count_of_active_assignments }  — in-memory cache
+# این شمارش فقط برای false-handling و آمار لحظه‌ای استفاده می‌شه، نه برای تصمیم تقسیم
 _active_assign_count: dict = {}
+
+# { member_name: count_of_alarms_received_today } — معیار اصلی تقسیم عادلانه.
+# هر آلارمی که به کسی داده بشه (چه فعال بمونه چه بعداً false بشه) اینجا شمرده می‌شه
+# و تا نیمه‌شب تهران صفر نمی‌شه. این یعنی کسی که همین الان false کرده، دیگه
+# «صفر» حساب نمی‌شه صرفاً چون آلارمش تموم شده — باید صبر کنه تا نوبت واقعی‌ش بشه.
+_daily_assign_count: dict = {}
+_daily_assign_date: str = ""  # تاریخ (YYYY-MM-DD تهران) که شمارش روزانه برای اون معتبره
+_daily_assign_lock = threading.Lock()
+
+def _tehran_today_str() -> str:
+    return datetime.now(TEHRAN).strftime("%Y-%m-%d")
+
+def _ensure_daily_reset():
+    """اگه روز عوض شده، شمارش روزانه رو صفر کن"""
+    global _daily_assign_count, _daily_assign_date
+    today = _tehran_today_str()
+    with _daily_assign_lock:
+        if _daily_assign_date != today:
+            _daily_assign_count = {}
+            _daily_assign_date = today
+
+def _bump_daily_count(name: str):
+    _ensure_daily_reset()
+    with _daily_assign_lock:
+        _daily_assign_count[name] = _daily_assign_count.get(name, 0) + 1
+
+def _get_daily_counts(members: list) -> dict:
+    _ensure_daily_reset()
+    with _daily_assign_lock:
+        return {m: _daily_assign_count.get(m, 0) for m in members}
+
+def _rebuild_daily_assign_count():
+    """بعد از ری‌استارت، شمارش روزانه رو از Supabase بازسازی کن — بدون این
+    کار، بعد از هر دیپلوی عدالت روزانه از صفر شروع می‌شد و بی‌معنی می‌شد."""
+    global _daily_assign_count, _daily_assign_date
+    rows = _sb_load_today_assignments()
+    counts = {}
+    for row in rows:
+        name = row.get("assigned_to", "")
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    with _daily_assign_lock:
+        _daily_assign_count = counts
+        _daily_assign_date = _tehran_today_str()
+    print(f"[assign] daily counts بازسازی شد: {counts}")
 
 # جلوگیری از double-handover: startup و scheduler هر کدوم فقط یه بار اجرا کنن
 # جلوگیری از race condition در /False — اگه یه آلارم داره false میشه، دیگران صبر کنن
@@ -907,6 +953,25 @@ def _sb_load_active_assignments():
         print(f"[assign] load exc: {e}")
     return []
 
+def _sb_load_today_assignments():
+    """
+    لود همه assignment‌هایی که امروز (از نیمه‌شب تهران) fired_at داشتن —
+    چه الان فعال باشن چه false شده باشن. برای بازسازی شمارش عادلانه‌ی
+    روزانه بعد از ری‌استارت لازمه.
+    """
+    if not SUPABASE_KEY: return []
+    try:
+        today_start = datetime.now(TEHRAN).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start_str = today_start.strftime("%Y-%m-%d %H:%M:%S")
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/alarm_assignments?fired_at=gte.{today_start_str}&select=assigned_to,fired_at",
+            headers=_sb_h(), timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"[assign] load today exc: {e}")
+    return []
+
 def _rebuild_active_assign_count(rows):
     """بازسازی count از Supabase rows — فقط assigned آلارم‌ها"""
     global _active_assign_count
@@ -921,19 +986,32 @@ def _rebuild_active_assign_count(rows):
 
 def _pick_assignee(members: list) -> str:
     """
-    از بین اعضا کسی رو انتخاب کن که کمترین آلارم فعال داره (عدالت).
-    اگه چند نفر مساوی دارن، رندوم از بین اونها انتخاب کن.
+    تقسیم عادلانه‌ی روزانه: کسی که امروز (از نیمه‌شب تهران) کمترین آلارم
+    دریافت کرده انتخاب می‌شه — نه کسی که الان کمترین آلارم فعال داره.
+    این یعنی وقتی کسی false می‌کنه، فوراً دوباره «صفر» حساب نمی‌شه؛ باید صبر
+    کنه تا واقعاً نوبتش با بقیه‌ی اعضا برابر بشه. اگه چند نفر مساوی دارن،
+    رندوم از بین اونها انتخاب می‌شه.
+
+    آلارم هیچ‌وقت بی‌صاحب نمی‌مونه: اگه همه مشغول باشن (هرکدوم حداقل یه
+    آلارم فعال دارن)، بازم بین کسایی که کمترین شمارش روزانه رو دارن تقسیم
+    می‌شه — فقط دیگه محدودیت زمانی/بازه اعمال نمی‌شه.
 
     استثنا: عضو DEPRIORITIZED_MEMBER تا حد امکان کنار گذاشته می‌شه —
-    فقط وقتی انتخاب می‌شه که واقعاً نوبتش شده (یعنی بقیه مشغول‌ترن یا هم‌سطح
-    مساوی‌ان و چاره‌ای نیست). تو بازه‌ی DEPRIORITIZED_BLOCK_START تا
-    DEPRIORITIZED_BLOCK_END فقط زمانی بهش می‌دیم که همه‌ی بقیه‌ی اعضا
-    خودشون یه آلارم فعال داشته باشن (یعنی واقعاً مجبوریم).
+    فقط وقتی انتخاب می‌شه که واقعاً نوبتش شده. تو بازه‌ی
+    DEPRIORITIZED_BLOCK_START تا DEPRIORITIZED_BLOCK_END فقط زمانی بهش
+    می‌دیم که همه‌ی بقیه‌ی اعضا خودشون یه آلارم فعال داشته باشن (مجبوریم).
     """
     import random
     if not members:
         return ""
-    counts = {m: _active_assign_count.get(m, 0) for m in members}
+
+    daily_counts = _get_daily_counts(members)
+    active_counts = {m: _active_assign_count.get(m, 0) for m in members}
+
+    def _finalize(chosen: str) -> str:
+        _active_assign_count[chosen] = _active_assign_count.get(chosen, 0) + 1
+        _bump_daily_count(chosen)
+        return chosen
 
     # اگه اولویت پایین مسعود از پنل خاموش شده باشه، دیگه استثنا قائل نشو —
     # دقیقاً مثل بقیه‌ی اعضا وارد چرخه‌ی عادلانه‌ی خالص می‌شه
@@ -946,46 +1024,38 @@ def _pick_assignee(members: list) -> str:
     in_block_hours = DEPRIORITIZED_BLOCK_START <= h_now < DEPRIORITIZED_BLOCK_END
 
     if has_deprioritized and others:
-        min_others = min(counts[m] for m in others)
-        min_dep = counts[DEPRIORITIZED_MEMBER]
+        min_others_daily = min(daily_counts[m] for m in others)
+        min_dep_daily = daily_counts[DEPRIORITIZED_MEMBER]
+        # «مجبوریم» یعنی همه‌ی بقیه همین الان یه آلارم فعال دارن — آلارم
+        # نباید بی‌صاحب بمونه، پس چاره‌ای جز دادن به یکی نیست
+        everyone_else_busy = all(active_counts[m] >= 1 for m in others)
 
         if in_block_hours:
-            # تو این بازه فقط اگه همه‌ی بقیه حداقل یه آلارم فعال دارن (یعنی
-            # کمترین‌شون >= 1) به مسعود می‌دیم — یعنی واقعاً مجبوریم.
-            forced = min_others >= 1
+            forced = everyone_else_busy
             if not forced:
-                candidates = [m for m in others if counts[m] == min_others]
-                chosen = random.choice(candidates)
-                _active_assign_count[chosen] = _active_assign_count.get(chosen, 0) + 1
-                return chosen
-            # مجبوریم: بین کسایی که کمترین آلارم رو دارن انتخاب کن (شاید همون دپریوریتایزد باشه)
-            min_count = min(counts.values())
-            candidates = [m for m, c in counts.items() if c == min_count]
-            chosen = random.choice(candidates)
-            _active_assign_count[chosen] = _active_assign_count.get(chosen, 0) + 1
-            return chosen
+                candidates = [m for m in others if daily_counts[m] == min_others_daily]
+                return _finalize(random.choice(candidates))
+            min_count = min(daily_counts.values())
+            candidates = [m for m, c in daily_counts.items() if c == min_count]
+            return _finalize(random.choice(candidates))
         else:
-            # خارج از بازه: فقط وقتی به دپریوریتایزد بده که واقعاً کمترین بار رو
-            # داره و بقیه مساوی یا بیشترن — یعنی رعایت عدالت واقعی، بدون بونس
-            # اضافه براش. اگه بقیه کمتر یا مساوی دارن، اول به اونا بده.
-            if min_others <= min_dep:
-                candidates = [m for m in others if counts[m] == min_others]
-                chosen = random.choice(candidates)
-                _active_assign_count[chosen] = _active_assign_count.get(chosen, 0) + 1
-                return chosen
+            if everyone_else_busy:
+                # مجبوریم بدیم — بین کمترین شمارش روزانه انتخاب کن (شاید مسعود باشه)
+                min_count = min(daily_counts.values())
+                candidates = [m for m, c in daily_counts.items() if c == min_count]
+                return _finalize(random.choice(candidates))
+            elif min_others_daily <= min_dep_daily:
+                candidates = [m for m in others if daily_counts[m] == min_others_daily]
+                return _finalize(random.choice(candidates))
             else:
-                min_count = min(counts.values())
-                candidates = [m for m, c in counts.items() if c == min_count]
-                chosen = random.choice(candidates)
-                _active_assign_count[chosen] = _active_assign_count.get(chosen, 0) + 1
-                return chosen
+                min_count = min(daily_counts.values())
+                candidates = [m for m, c in daily_counts.items() if c == min_count]
+                return _finalize(random.choice(candidates))
 
-    # حالت عادی (بدون عضو دپریوریتایزد در لیست) — عادلانه‌ی خالص
-    min_count = min(counts.values())
-    candidates = [m for m, c in counts.items() if c == min_count]
-    chosen = random.choice(candidates)
-    _active_assign_count[chosen] = _active_assign_count.get(chosen, 0) + 1
-    return chosen
+    # حالت عادی (بدون عضو دپریوریتایزد در لیست) — عادلانه‌ی روزانه‌ی خالص
+    min_count = min(daily_counts.values())
+    candidates = [m for m, c in daily_counts.items() if c == min_count]
+    return _finalize(random.choice(candidates))
 
 def _get_assignee_for_alarm(alarm_id: str, alarm_tag: str, fired_at: str,
                             symbol: str = "", target_price: float = 0, created_by: str = "") -> tuple:
@@ -1013,6 +1083,7 @@ def _sb_restore_on_startup():
     global _deprioritize_masoud_active
     rows = _sb_load_active_assignments()
     _rebuild_active_assign_count(rows)
+    _rebuild_daily_assign_count()
     with _deprioritize_masoud_lock:
         _deprioritize_masoud_active = _sb_load_deprioritize_masoud()
     print(f"[assign] startup: {len(rows)} آلارم active از Supabase بازسازی شد — "
