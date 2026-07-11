@@ -989,8 +989,12 @@ def _pick_assignee(members: list) -> str:
     تقسیم عادلانه‌ی روزانه: کسی که امروز (از نیمه‌شب تهران) کمترین آلارم
     دریافت کرده انتخاب می‌شه — نه کسی که الان کمترین آلارم فعال داره.
     این یعنی وقتی کسی false می‌کنه، فوراً دوباره «صفر» حساب نمی‌شه؛ باید صبر
-    کنه تا واقعاً نوبتش با بقیه‌ی اعضا برابر بشه. اگه چند نفر مساوی دارن،
-    رندوم از بین اونها انتخاب می‌شه.
+    کنه تا واقعاً نوبتش با بقیه‌ی اعضا برابر بشه.
+
+    تای‌بریک: اگه چند نفر شمارش روزانه‌شون مساوی بود، اول بین کسایی که
+    همین الان هیچ آلارم فعالی ندارن انتخاب می‌شه (نه رندوم کامل بین همه‌ی
+    هم‌سطح‌ها) — تا آلارم به کسی که واقعاً بی‌کاره برسه، نه کسی که فقط
+    شانسی شمارش روزانه‌ش با بقیه برابره ولی همین الان مشغوله.
 
     آلارم هیچ‌وقت بی‌صاحب نمی‌مونه: اگه همه مشغول باشن (هرکدوم حداقل یه
     آلارم فعال دارن)، بازم بین کسایی که کمترین شمارش روزانه رو دارن تقسیم
@@ -1013,6 +1017,19 @@ def _pick_assignee(members: list) -> str:
         _bump_daily_count(chosen)
         return chosen
 
+    def _choose_among(pool: list) -> str:
+        """
+        از بین pool، اول بر اساس کمترین شمارش روزانه فیلتر کن. اگه چند نفر
+        مساوی بودن، تای‌بریک دوم: بین اونایی که الان صفر آلارم فعال دارن
+        انتخاب کن (تا آلارم به کسی که همین الان بی‌کاره برسه، نه کسی که
+        شانسی هم‌سطح روزانه‌ست ولی الان مشغوله). اگه بازم مساوی بودن، رندوم.
+        """
+        min_daily = min(daily_counts[m] for m in pool)
+        tied = [m for m in pool if daily_counts[m] == min_daily]
+        idle = [m for m in tied if active_counts[m] == 0]
+        final_pool = idle if idle else tied
+        return random.choice(final_pool)
+
     # اگه اولویت پایین مسعود از پنل خاموش شده باشه، دیگه استثنا قائل نشو —
     # دقیقاً مثل بقیه‌ی اعضا وارد چرخه‌ی عادلانه‌ی خالص می‌شه
     deprioritize_on = _get_deprioritize_masoud()
@@ -1033,29 +1050,19 @@ def _pick_assignee(members: list) -> str:
         if in_block_hours:
             forced = everyone_else_busy
             if not forced:
-                candidates = [m for m in others if daily_counts[m] == min_others_daily]
-                return _finalize(random.choice(candidates))
-            min_count = min(daily_counts.values())
-            candidates = [m for m, c in daily_counts.items() if c == min_count]
-            return _finalize(random.choice(candidates))
+                return _finalize(_choose_among(others))
+            return _finalize(_choose_among(members))
         else:
             if everyone_else_busy:
                 # مجبوریم بدیم — بین کمترین شمارش روزانه انتخاب کن (شاید مسعود باشه)
-                min_count = min(daily_counts.values())
-                candidates = [m for m, c in daily_counts.items() if c == min_count]
-                return _finalize(random.choice(candidates))
+                return _finalize(_choose_among(members))
             elif min_others_daily <= min_dep_daily:
-                candidates = [m for m in others if daily_counts[m] == min_others_daily]
-                return _finalize(random.choice(candidates))
+                return _finalize(_choose_among(others))
             else:
-                min_count = min(daily_counts.values())
-                candidates = [m for m, c in daily_counts.items() if c == min_count]
-                return _finalize(random.choice(candidates))
+                return _finalize(_choose_among(members))
 
     # حالت عادی (بدون عضو دپریوریتایزد در لیست) — عادلانه‌ی روزانه‌ی خالص
-    min_count = min(daily_counts.values())
-    candidates = [m for m, c in daily_counts.items() if c == min_count]
-    return _finalize(random.choice(candidates))
+    return _finalize(_choose_among(members))
 
 def _get_assignee_for_alarm(alarm_id: str, alarm_tag: str, fired_at: str,
                             symbol: str = "", target_price: float = 0, created_by: str = "") -> tuple:
